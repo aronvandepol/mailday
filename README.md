@@ -1,5 +1,9 @@
 # Mailday
 
+I spend most of my time living in a terminal. Between Neovim and other TUI apps, it seemed silly that I wasn't also reading my mail and calendar from the terminal. I tried NeoMutt for a bit, but it never clicked with me the way Neovim did. Then I noticed that HEY had released a terminal client for their email service. I wasn't interested in switching email services, but I wanted something like it.
+
+I made Mailday by taking the interface from hey-cli and prompting an AI assistant to add features as I needed them over the course of my day. In the spirit of sharing small wins, here it is. It's opinionated, since it was built for me, so it may not handle every edge case yet.
+
 Mailday is a terminal mail and calendar app for mail you already keep in local Maildirs. If you sync with mbsync and send with msmtp, it fits into what you have: it shows your inbox and your week side by side in one full-screen program, and leaves downloading to mbsync, so NeoMutt, notmuch and the mail app on your phone keep working as before.
 
 ![Mail](docs/screenshots/mail.png)
