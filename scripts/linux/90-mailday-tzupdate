@@ -1,0 +1,38 @@
+#!/bin/bash
+# NetworkManager dispatcher script: when a connection comes up, or the
+# connectivity changes, set the system time zone from the new network's
+# location with tzupdate (if installed). mailday-syncd follows the zone within
+# a minute. Install with: make install-tz
+#
+# Always exits 0: a failed time zone guess must never hold up the network
+# event. tzupdate runs in the background, killed after 20 s, and logs to the
+# journal (journalctl -t mailday-tzupdate).
+#
+# NetworkManager calls it with the interface name and the action.
+
+interface=${1:-}
+action=${2:-}
+
+# Loopback comes up at every boot and says nothing about where we are.
+[[ $interface == lo ]] && exit 0
+
+case $action in
+up | connectivity-change) ;;
+*) exit 0 ;;
+esac
+
+command -v tzupdate >/dev/null 2>&1 || exit 0
+
+(
+  timeout 20 tzupdate -q 2>&1 | logger -t mailday-tzupdate
+  status=${PIPESTATUS[0]}
+  if [[ $status -eq 124 ]]; then
+    logger -t mailday-tzupdate "tzupdate timed out after 20 s ($action on ${interface:-no interface})"
+  elif [[ $status -ne 0 ]]; then
+    logger -t mailday-tzupdate "tzupdate failed with status $status ($action on ${interface:-no interface})"
+  else
+    logger -t mailday-tzupdate "tzupdate ran ($action on ${interface:-no interface})"
+  fi
+) </dev/null >/dev/null 2>&1 &
+
+exit 0

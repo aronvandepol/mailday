@@ -1,0 +1,229 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""Write Google calendars as ICS files for mailday.
+
+Downloads the iCal feeds listed under [calendar] feeds in
+~/.config/mailday/config.toml (path override: $MAILDAY_CONFIG), and, when
+[calendar] google_script points at a gcal.py-compatible module, fetches Google
+calendars through its service account, so it needs no browser login and keeps
+working unattended. When [exchange] user is set and a token was stored by
+`mailday-exchange authorize`, the Exchange calendar is synced too. Each calendar
+becomes <Name>.ics in ~/.local/share/mailday/calendars, which mailday reads on
+start and on `r`. Files are replaced atomically, and a calendar that failed to fetch keeps
+its last good copy. The other calendars are still written, each failure is
+printed to stderr, and the run then exits with status 2 so the daemon reports
+it rather than leaving a stale calendar unnoticed.
+
+  mailday-calsync              # 30 days back, 180 days ahead
+  mailday-calsync --back 60 --ahead 365
+"""
+import argparse, datetime as dt, json, os, subprocess, sys, tomllib, urllib.request
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+
+def load_config() -> dict:
+    """Settings from $MAILDAY_CONFIG, else $XDG_CONFIG_HOME/mailday/config.toml,
+    else ~/.config/mailday/config.toml. A missing file means defaults."""
+    explicit = os.environ.get("MAILDAY_CONFIG")
+    base = os.environ.get("XDG_CONFIG_HOME") or "~/.config"
+    path = Path(explicit or Path(base) / "mailday" / "config.toml").expanduser()
+    try:
+        with open(path, "rb") as handle:
+            return tomllib.load(handle)
+    except FileNotFoundError:
+        return {}
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        sys.exit(f"{Path(sys.argv[0]).name}: cannot read {path}: {error}")
+
+
+CONFIG = load_config()
+
+
+def setting(section: str, key: str, default=""):
+    value = (CONFIG.get(section) or {}).get(key)
+    return default if value is None else value
+
+
+# iCal feeds are downloaded as published; the list lives in the config file.
+PUBLIC_FEEDS = {f["name"].replace("/", "_"): f["url"] for f in setting("calendar", "feeds", [])
+                if isinstance(f, dict) and f.get("name") and f.get("url")}
+GCAL_PATH = os.environ.get("GCAL_SCRIPT") or setting("calendar", "google_script")
+GCAL = Path(GCAL_PATH).expanduser() if GCAL_PATH else None
+OUT = Path(os.environ.get("MAILDAY_ICS_DIR", "~/.local/share/mailday/calendars")).expanduser()
+
+
+def escape(text: str) -> str:
+    return (text.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,")
+            .replace("\r\n", "\\n").replace("\n", "\\n").replace("\r", "\\n"))
+
+
+def fold(line: str) -> str:
+    # RFC 5545: lines over 75 octets continue on the next line after a space.
+    raw, out = line.encode(), []
+    while len(raw) > 75:
+        cut = 75 if not out else 74
+        while cut and (raw[cut] & 0xC0) == 0x80:  # never split a UTF-8 sequence
+            cut -= 1
+        out.append(raw[:cut].decode())
+        raw = raw[cut:]
+    out.append(raw.decode())
+    return "\r\n ".join(out)
+
+
+def stamp(value: dict) -> str:
+    if "date" in value:
+        return ";VALUE=DATE:" + value["date"].replace("-", "")
+    t = dt.datetime.fromisoformat(value["dateTime"])
+    if t.tzinfo is None:  # Google always sends an offset; if not, use the event's zone, never the machine's
+        t = t.replace(tzinfo=ZoneInfo(value.get("timeZone") or "UTC"))
+    t = t.astimezone(dt.timezone.utc)
+    return ":" + t.strftime("%Y%m%dT%H%M%SZ")
+
+
+# The user's own Google addresses: events they organize are the user's to move.
+_own = os.environ.get("MAILDAY_GOOGLE_OWN")
+OWN = {a.strip().lower() for a in (_own.split(",") if _own is not None else setting("calendar", "google_own", []))
+       if isinstance(a, str) and a.strip()}
+READ_ONLY = {"Holidays"}
+
+
+def editable(e: dict, calendar: str) -> bool:
+    """The user's own events can be moved from Mailday; invitations cannot."""
+    if calendar in READ_ONLY:
+        return False
+    organizer = (e.get("organizer") or {}).get("email", "").lower()
+    return (not organizer or organizer in OWN or organizer.endswith("@group.calendar.google.com")
+            or bool(e.get("guestsCanModify")))
+
+
+def vevent(e: dict, now: str, calendar: str = "") -> list[str]:
+    lines = ["BEGIN:VEVENT", f"UID:{escape(e.get('iCalUID') or e['id'])}", f"DTSTAMP:{now}",
+             "DTSTART" + stamp(e["start"]), "DTEND" + stamp(e["end"]),
+             f"SUMMARY:{escape(e.get('summary', '(no title)'))}",
+             # Mailday moves and deletes through these (mailday-calendar).
+             f"X-MAILDAY-ID:{escape(e['id'])}",
+             f"X-MAILDAY-EDITABLE:{'TRUE' if editable(e, calendar) else 'FALSE'}"]
+    if e.get("recurringEventId"):
+        lines.append("X-MAILDAY-SERIES:TRUE")
+    organizer = e.get("organizer") or {}
+    proposal = ((e.get("extendedProperties") or {}).get("private") or {}).get("maildayProposal")
+    if proposal:
+        # mailday-calendar create --proposal: the user's own tentative event, answered like an invitation
+        # (a accepts and confirms it, x deletes it).
+        lines.append(f"X-MAILDAY-ORGANIZER:{escape(proposal)}")
+        lines.append("X-MAILDAY-RSVP:needs-action")
+    elif organizer.get("email", "").lower() not in OWN and not organizer.get("email", "").endswith("@group.calendar.google.com"):
+        if name := organizer.get("displayName") or organizer.get("email"):
+            lines.append(f"X-MAILDAY-ORGANIZER:{escape(name)}")
+        # The user's answer to the invitation, for Mailday's a / ~ / x.
+        for attendee in e.get("attendees", []):
+            if attendee.get("email", "").lower() in OWN:
+                answer = {"needsAction": "needs-action", "accepted": "accepted",
+                          "tentative": "tentative", "declined": "declined"}.get(attendee.get("responseStatus"), "")
+                if answer:
+                    lines.append(f"X-MAILDAY-RSVP:{answer}")
+                break
+    guests = [a.get("displayName") or a.get("email", "") for a in e.get("attendees", [])
+              if a.get("email", "").lower() not in OWN and not a.get("resource")]
+    if guests:
+        lines.append(f"X-MAILDAY-ATTENDEES:{escape(', '.join(guests[:20]))}")
+    if e.get("location"):
+        lines.append(f"LOCATION:{escape(e['location'])}")
+    # A Meet or Zoom link from the conference data goes first in the notes,
+    # where Mailday's J finds it.
+    join = e.get("hangoutLink") or next((p.get("uri") for p in e.get("conferenceData", {}).get("entryPoints", [])
+                                         if p.get("entryPointType") == "video"), None)
+    notes = e.get("description", "")[:4000]
+    if join and join not in notes:
+        notes = f"Join: {join}" + ("\n\n" + notes if notes else "")
+    if notes:
+        lines.append(f"DESCRIPTION:{escape(notes)}")
+    if e.get("status") == "tentative":
+        lines.append("STATUS:TENTATIVE")
+    lines.append("END:VEVENT")
+    return lines
+
+
+def write_calendars(envelope: dict, out: Path, now: str) -> tuple[list[str], list[str]]:
+    """Write each fetched calendar to out/<name>.ics. gcal.py reports a calendar
+    it could not fetch under "failures" and still exits 0, so those come back
+    as messages for the caller to report; their old files stay as they were."""
+    out.mkdir(parents=True, exist_ok=True)
+    written = []
+    for cal in envelope["calendars"]:
+        events = [e for e in cal["events"] if e.get("status") != "cancelled" and "start" in e]
+        lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//mailday//calsync//EN",
+                 f"X-WR-CALNAME:{escape(cal['name'])}"]
+        for e in events:
+            lines += vevent(e, now, cal["name"])
+        lines.append("END:VCALENDAR")
+        target = out / f"{cal['name']}.ics"
+        tmp = target.with_suffix(".ics.tmp")
+        tmp.write_text("\r\n".join(fold(l) for l in lines) + "\r\n")
+        tmp.replace(target)
+        written.append(f"{cal['name']}={len(events)}")
+    failures = [f"{f.get('calendar', '?')} not refreshed: {f.get('error', 'unknown error')}"
+                for f in envelope.get("failures") or []]
+    return written, failures
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--back", type=int, default=30, help="days before today")
+    ap.add_argument("--ahead", type=int, default=180, help="days after today")
+    args = ap.parse_args()
+
+    today = dt.date.today()
+    start, end = today - dt.timedelta(days=args.back), today + dt.timedelta(days=args.ahead)
+    envelope = {"calendars": [], "failures": []}
+    if GCAL is not None and not GCAL.exists():
+        print(f"note: [calendar] google_script {GCAL} does not exist; skipping Google calendars", file=sys.stderr)
+    elif GCAL is not None:
+        proc = subprocess.run(["uv", "run", str(GCAL), "fetch", "--holidays",
+                               "--start", start.isoformat(), "--end", end.isoformat()],
+                              capture_output=True, text=True, timeout=300)
+        if proc.returncode != 0:
+            sys.exit(f"gcal.py fetch failed: {proc.stderr.strip()[-500:]}")
+        envelope = json.loads(proc.stdout)
+
+    now = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    written, failures = write_calendars(envelope, OUT, now)
+    for name, url in PUBLIC_FEEDS.items():
+        try:
+            with urllib.request.urlopen(url, timeout=60) as resp:
+                data = resp.read()
+        except OSError as e:
+            print(f"warning: {name} not refreshed: {e}", file=sys.stderr)
+            continue
+        if not data.lstrip().startswith(b"BEGIN:VCALENDAR"):
+            print(f"warning: {name} returned no calendar", file=sys.stderr)
+            continue
+        target = OUT / f"{name}.ics"
+        tmp = target.with_suffix(".ics.tmp")
+        tmp.write_bytes(data)
+        tmp.replace(target)
+        written.append(f"{name.replace(' ', '_')}={data.count(b'BEGIN:VEVENT')}")
+    print(f"{dt.datetime.now().isoformat(timespec='seconds')} wrote {' '.join(written)} to {OUT}")
+
+    # The Microsoft 365 calendar comes over EWS once [exchange] user is set and
+    # `mailday-exchange authorize` has stored a token. A failure there must
+    # not undo the files written above.
+    exchange = Path(__file__).with_name("mailday-exchange")
+    user = os.environ.get("MAILDAY_EXCHANGE_USER") or setting("exchange", "user")
+    token = Path(os.environ.get("MAILDAY_EXCHANGE_TOKEN") or setting("exchange", "token", "~/.config/mailday/ews-token.gpg")).expanduser()
+    if user and exchange.exists() and token.exists():
+        result = subprocess.run([str(exchange), "sync"], capture_output=True, text=True, timeout=300)
+        print((result.stdout or result.stderr).strip(), file=sys.stdout if result.returncode == 0 else sys.stderr)
+
+    for failure in failures:
+        print(f"warning: {failure}", file=sys.stderr)
+    if failures:
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

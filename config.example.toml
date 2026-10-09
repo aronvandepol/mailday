@@ -1,0 +1,69 @@
+# Mailday configuration: copy to ~/.config/mailday/config.toml.
+# Every key is optional. MAILDAY_CONFIG points Mailday at another file.
+
+# Display name for identities that set none.
+name = "Alex Morgan"
+
+# Where the snooze list, recipient groups and job leases live. Point it at a
+# folder you sync between machines (Syncthing, Dropbox) to share them.
+# Default: ~/.local/share/mailday
+shared_dir = "~/Sync/mailday"
+
+# Sending identities. Without any, Mailday sends as each msmtp account's
+# `from` address. `accounts` are the account folder names under ~/Mail (or
+# ~/.local/share/mail) that this identity belongs to.
+[[identity]]
+accounts = ["work"]
+address = "alex.morgan@northwind.example"
+aliases = ["a.morgan@northwind.example"]     # other addresses that are you
+signature = ["Alex Morgan", "Design Lead · Northwind Studio", "northwind.example"]
+short_signature = ["Alex"]                   # under replies; default: your first name
+save_sent = false                            # Gmail and Microsoft 365 keep their own Sent copy
+
+[[identity]]
+accounts = ["personal"]
+address = "alex@morgan.example"
+signature = ["Alex"]
+save_sent = true                             # file a copy in Sent yourself
+
+# Fixed keys for your own folders in the file (f) and go (g) pickers.
+# Inbox i, @Reply r, @Waiting w and Archive x are built in; other folders
+# get the first free letter of their name.
+[mail.box_keys]
+"@Clients" = "c"
+"@Hiring" = "h"
+
+[sync]
+# Shell command mailday-syncd runs after syncs. Default: notmuch new --quiet
+# when notmuch is installed.
+post_sync = "notmuch new --quiet"
+
+[calendar]
+# iCal feeds mailday-calsync downloads, such as a Google calendar's secret
+# iCal address or a public holiday calendar.
+feeds = [
+  { name = "Holidays", url = "https://example.com/holidays.ics" },
+]
+# Optional module for Google calendars through the API (needed to edit them).
+google_script = ""
+# Your Google addresses, so your own answers to invitations show.
+google_own = []
+# The zone your calendars are kept in. While you travel, Mailday shows home
+# time beside local time. Default: the zone Mailday started in.
+home_zone = "Europe/Berlin"
+
+# A Microsoft 365 calendar over EWS. Off while `user` is empty. Run
+# `mailday-exchange authorize` once to store a token.
+[exchange]
+user = "alex.morgan@northwind.example"
+calendar = "Outlook"                         # name of the calendar and its .ics file
+token = "~/.config/mailday/ews-token.gpg"
+# Thunderbird's public Microsoft client ID. Some organisations do not allow it.
+client_id = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
+ews_url = "https://outlook.office365.com/EWS/Exchange.asmx"
+mailbox_tz = ""                              # zone of the mailbox, for all-day events
+
+# After you reply to a message in @Reply, ask `claude -p` whether your reply
+# settles it, and archive it if so. Needs the Claude CLI.
+[reply_judge]
+enabled = false

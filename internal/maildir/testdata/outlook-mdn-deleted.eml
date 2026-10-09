@@ -1,0 +1,35 @@
+Received: from AM0PR01MB1234.eurprd01.prod.exchangelabs.com (2603:10a6:208:1::1)
+ by AM0PR01MB5678.eurprd01.prod.exchangelabs.com with HTTPS; Tue, 7 Oct 2025 14:02:11 +0000
+From: Ruben Bakker <r.e.bakker@hum.uni.example>
+To: Sam de Vries <s.de.vries@hum.uni.example>
+Subject: Not read: Chapter 3 draft
+Date: Tue, 7 Oct 2025 14:02:09 +0200
+Message-ID: <AM0PR01MB5678C0FFEE@AM0PR01MB5678.eurprd01.prod.exchangelabs.com>
+Content-Language: en-US
+Content-Type: multipart/report; report-type=disposition-notification;
+ boundary="_004_AM0PR01MB5678C0FFEE_"
+MIME-Version: 1.0
+
+--_004_AM0PR01MB5678C0FFEE_
+Content-Type: text/plain; charset="us-ascii"
+Content-Transfer-Encoding: quoted-printable
+
+Your message
+
+  To:      Ruben Bakker
+  Subject: Chapter 3 draft
+  Sent:    Tue, 7 Oct 2025 13:40:12 +0200
+
+was deleted without being read on Tue, 7 Oct 2025 14:02:09 +0200.
+
+--_004_AM0PR01MB5678C0FFEE_
+Content-Type: message/disposition-notification; name="MDNPART2.txt"
+Content-Disposition: attachment; filename="MDNPART2.txt"
+Content-Transfer-Encoding: 7bit
+
+Reporting-UA: AM0PR01MB5678.eurprd01.prod.exchangelabs.com; Microsoft Exchange Server
+Final-Recipient: rfc822;r.e.bakker@hum.uni.example
+Original-Message-ID: <1759837212000000000.a1b2c3d4e5f60718@samdevries.example>
+Disposition: manual-action/MDN-sent-manually; deleted
+
+--_004_AM0PR01MB5678C0FFEE_--

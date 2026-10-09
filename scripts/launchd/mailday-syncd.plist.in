@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Mailday live mail sync on macOS. `make install-launchd` fills in @HOME@
+     and loads it as ~/Library/LaunchAgents/local.mailday.syncd.plist. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>local.mailday.syncd</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string><string>-c</string>
+    <!-- Homebrew's isync links the system libsasl2, which finds Homebrew's
+         XOAUTH2 plugin (Microsoft 365, Gmail OAuth) only through SASL_PATH. -->
+    <string>sasl=/opt/homebrew/opt/cyrus-sasl/lib/sasl2; [ -d "$sasl" ] &amp;&amp; export SASL_PATH="$sasl"; exec "$HOME/.local/bin/mailday-syncd"</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>@HOME@/.local/share/mise/shims:@HOME@/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <!-- Time to let a running mbsync stop cleanly before launchd kills it. -->
+  <key>ExitTimeOut</key><integer>45</integer>
+  <!-- Not /tmp: it is not cleared on a Mac that stays up for weeks, and
+       ~/Library/Logs is where Console.app looks. launchd does not expand ~. -->
+  <key>StandardErrorPath</key><string>@HOME@/Library/Logs/mailday-syncd.log</string>
+  <key>StandardOutPath</key><string>@HOME@/Library/Logs/mailday-syncd.log</string>
+</dict>
+</plist>

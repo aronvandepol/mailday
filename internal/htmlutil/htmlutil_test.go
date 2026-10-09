@@ -1,0 +1,322 @@
+package htmlutil
+
+import (
+	"encoding/json"
+	stdhtml "html"
+	"strings"
+	"testing"
+)
+
+func embeddedHTMLFigure(t *testing.T, content string) string {
+	t.Helper()
+	attributes, err := json.Marshal(struct {
+		ContentType string `json:"contentType"`
+		Content     string `json:"content"`
+	}{ContentType: "text/html", Content: content})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return `<figure data-trix-attachment="` + stdhtml.EscapeString(string(attributes)) + `"></figure>`
+}
+
+func canonicalEmbeddedHTML(content string) string {
+	return `<action-text-attachment content-type="text/html" content="` + stdhtml.EscapeString(content) + `"></action-text-attachment>`
+}
+
+func TestToTextPlain(t *testing.T) {
+	got := ToText("hello world")
+	if got != "hello world" {
+		t.Errorf("ToText plain = %q, want %q", got, "hello world")
+	}
+}
+
+func TestToTextParagraphs(t *testing.T) {
+	got := ToText("<p>First</p><p>Second</p>")
+	if !strings.Contains(got, "First") || !strings.Contains(got, "Second") {
+		t.Errorf("ToText paragraphs = %q, should contain First and Second", got)
+	}
+}
+
+func TestToTextBr(t *testing.T) {
+	got := ToText("line1<br>line2")
+	if !strings.Contains(got, "line1\nline2") {
+		t.Errorf("ToText br = %q, should contain newline between lines", got)
+	}
+}
+
+func TestToTextList(t *testing.T) {
+	got := ToText("<ul><li>one</li><li>two</li></ul>")
+	if !strings.Contains(got, "• one") {
+		t.Errorf("ToText list = %q, should contain bullet items", got)
+	}
+	if !strings.Contains(got, "• two") {
+		t.Errorf("ToText list = %q, should contain second bullet", got)
+	}
+}
+
+func TestToTextStripsEntities(t *testing.T) {
+	got := ToText("&amp; &lt; &gt;")
+	if !strings.Contains(got, "& < >") {
+		t.Errorf("ToText entities = %q, should decode HTML entities", got)
+	}
+}
+
+func TestToTextStripsScript(t *testing.T) {
+	got := ToText("<p>hello</p><script>alert('xss')</script>")
+	if strings.Contains(got, "alert") {
+		t.Errorf("ToText should strip script content, got %q", got)
+	}
+}
+
+func TestToTextEmpty(t *testing.T) {
+	got := ToText("")
+	if got != "" {
+		t.Errorf("ToText empty = %q, want empty", got)
+	}
+}
+
+func TestMessageSourceTextMatchesBrowserSelectionContent(t *testing.T) {
+	tests := []struct {
+		name string
+		html string
+		want string
+	}{
+		{name: "inline formatting", html: `<p>quarter<strong>ly</strong> plan</p>`, want: "quarterly plan"},
+		{name: "blocks and list items", html: `<p>First line</p><ul><li>Revenue up</li><li>Churn down</li></ul>`, want: "First line Revenue up Churn down"},
+		{name: "section boundaries", html: `<section>Alpha</section><section>Beta</section>`, want: "Alpha Beta"},
+		{name: "computed block boundaries", html: `<span style="display:block">Alpha</span><span style="display:block">Beta</span>`, want: "Alpha Beta"},
+		{name: "computed inline flow", html: `<div style="display:inline">Alpha</div><div style="display:inline">Beta</div>`, want: "AlphaBeta"},
+		{name: "entities", html: `<p>R&amp;D uses &lt;draft&gt;&nbsp;today</p>`, want: "R&D uses <draft> today"},
+		{name: "line break", html: `<p>First<br>Second</p>`, want: "First Second"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := strings.Join(strings.Fields(MessageSourceText(tt.html)), " "); got != tt.want {
+				t.Errorf("MessageSourceText = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMessageSourceTextIncludesEmbeddedEmailBody(t *testing.T) {
+	html := `<figure data-trix-attachment='{"contentType":"text/html","content":"<shadow-content><template><p>External confirmation: BLUE-42</p></template></shadow-content>"}'></figure>`
+	if got := strings.Join(strings.Fields(MessageSourceText(html)), " "); got != "External confirmation: BLUE-42" {
+		t.Errorf("MessageSourceText = %q", got)
+	}
+}
+
+func TestMessageSourceTextFailsClosedWhenHTMLExceedsParserDepth(t *testing.T) {
+	html := strings.Repeat("<div>", 1_000) + "not selectable" + strings.Repeat("</div>", 1_000)
+	if got := MessageSourceText(html); got != "" {
+		t.Errorf("MessageSourceText returned unparsed source bytes: %q", got[:min(len(got), 80)])
+	}
+}
+
+func TestMessageSourceTextExcludesNonselectableContent(t *testing.T) {
+	html := `<p>Visible</p><script>hidden script</script><style>.hidden { content: "style text" }</style><action-text-attachment filename="report.pdf"><span>attachment internals</span></action-text-attachment>`
+	if got := strings.Join(strings.Fields(MessageSourceText(html)), " "); got != "Visible" {
+		t.Errorf("MessageSourceText = %q, want visible message text only", got)
+	}
+}
+
+func TestMessageSourceTextHonorsHTMLVisibility(t *testing.T) {
+	tests := []struct {
+		name string
+		html string
+		want string
+	}{
+		{name: "hidden attribute", html: `<p>Before</p><p hidden>Secret</p><p>After</p>`, want: "Before After"},
+		{name: "inert subtree", html: `<p>Before</p><div inert>Inactive</div><p>After</p>`, want: "Before After"},
+		{name: "display none", html: `<p>Before</p><div style="DISPLAY: none !important">Hidden</div><p>After</p>`, want: "Before After"},
+		{name: "later display wins", html: `<p style="display: none; display: block">Visible</p>`, want: "Visible"},
+		{name: "important display wins", html: `<p style="display: none !important; display: block">Hidden</p>`, want: ""},
+		{name: "visibility hidden", html: `<p>Before</p><span style="visibility: hidden">Hidden</span><p>After</p>`, want: "Before After"},
+		{name: "selection disabled", html: `<p>Before</p><span style="-webkit-user-select:none">Hidden</span><p>After</p>`, want: "Before After"},
+		{name: "ordinary template", html: `<p>Before</p><template><p>Inactive template</p></template><p>After</p>`, want: "Before After"},
+		{name: "closed dialog", html: `<p>Before</p><dialog>Closed dialog</dialog><p>After</p>`, want: "Before After"},
+		{name: "closed details", html: `<details><summary>Visible summary</summary><p>Closed content</p></details>`, want: "Visible summary"},
+		{name: "open details and dialog", html: `<details open><summary>Summary</summary><p>Details</p></details><dialog open>Dialog</dialog>`, want: "Summary Details Dialog"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := strings.Join(strings.Fields(MessageSourceText(tt.html)), " "); got != tt.want {
+				t.Errorf("MessageSourceText = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestToTextImgTag(t *testing.T) {
+	got := ToText(`<p>Before</p><img src="test.png" alt="photo"><p>After</p>`)
+	if !strings.Contains(got, "[photo]") {
+		t.Errorf("ToText should render img alt text, got %q", got)
+	}
+	if !strings.Contains(got, "Before") || !strings.Contains(got, "After") {
+		t.Errorf("ToText should include surrounding text, got %q", got)
+	}
+}
+
+func TestToTextImgNoAlt(t *testing.T) {
+	got := ToText(`<img src="test.png">`)
+	if !strings.Contains(got, "[image]") {
+		t.Errorf("ToText should show [image] for img without alt, got %q", got)
+	}
+}
+
+func TestToTextActionTextAttachment(t *testing.T) {
+	got := ToText(`<p>Text</p><action-text-attachment filename="photo.png"><img src="url"></action-text-attachment><p>More</p>`)
+	if !strings.Contains(got, "[photo.png]") {
+		t.Errorf("ToText should show filename for action-text-attachment, got %q", got)
+	}
+	if !strings.Contains(got, "Text") || !strings.Contains(got, "More") {
+		t.Errorf("ToText should include surrounding text, got %q", got)
+	}
+	if strings.Contains(got, "[image]") {
+		t.Errorf("ToText should skip inner content of action-text-attachment, got %q", got)
+	}
+}
+
+func TestToTextTrixFigure(t *testing.T) {
+	got := ToText(`<p>Before</p><figure data-trix-attachment='{"filename":"photo.png","url":"/img.png","contentType":"image/png"}'></figure><p>After</p>`)
+	if !strings.Contains(got, "[photo.png]") {
+		t.Errorf("ToText should show filename for trix figure, got %q", got)
+	}
+	if !strings.Contains(got, "Before") || !strings.Contains(got, "After") {
+		t.Errorf("ToText should include surrounding text, got %q", got)
+	}
+}
+
+func TestToTextEmbeddedContentStopsRecursing(t *testing.T) {
+	nested := "<p>innermost</p>"
+	for range embeddedContentDepthLimit + 1 {
+		nested = embeddedHTMLFigure(t, nested)
+	}
+
+	if got := ToText(nested); strings.Contains(got, "innermost") {
+		t.Errorf("ToText = %q, should stop before the innermost level", got)
+	}
+}
+
+func TestExtractImageURLsInsideEmbeddedHTMLAttachment(t *testing.T) {
+	urls := ExtractImageURLs(`<figure data-trix-attachment='{"contentType":"text/html","content":"<p><img src=\"https://example.com/logo.png\"></p>"}'></figure>`)
+	if len(urls) != 1 || urls[0] != "https://example.com/logo.png" {
+		t.Errorf("ExtractImageURLs = %v, want the image inside the embedded body", urls)
+	}
+}
+
+func TestExtractImageURLs(t *testing.T) {
+	h := `<p>Hello</p><img src="https://example.com/a.png"><img src="https://example.com/b.jpg">`
+	urls := ExtractImageURLs(h)
+	if len(urls) != 2 {
+		t.Fatalf("ExtractImageURLs got %d urls, want 2", len(urls))
+	}
+	if urls[0] != "https://example.com/a.png" {
+		t.Errorf("url[0] = %q, want %q", urls[0], "https://example.com/a.png")
+	}
+	if urls[1] != "https://example.com/b.jpg" {
+		t.Errorf("url[1] = %q, want %q", urls[1], "https://example.com/b.jpg")
+	}
+}
+
+func TestExtractImageURLsNone(t *testing.T) {
+	urls := ExtractImageURLs("<p>No images here</p>")
+	if len(urls) != 0 {
+		t.Errorf("ExtractImageURLs got %d urls, want 0", len(urls))
+	}
+}
+
+func TestExtractImageURLsEmptySrc(t *testing.T) {
+	urls := ExtractImageURLs(`<img src="">`)
+	if len(urls) != 0 {
+		t.Errorf("ExtractImageURLs should skip empty src, got %d urls", len(urls))
+	}
+}
+
+func TestExtractImageURLsActionTextImage(t *testing.T) {
+	h := `<action-text-attachment url="/rails/blobs/photo.png" filename="photo.png" content-type="image/png"></action-text-attachment>
+<action-text-attachment url="https://gopher.hey.com/signed/photo.jpg" content-type="image"></action-text-attachment>
+<action-text-attachment url="/rails/blobs/report.pdf" filename="report.pdf" content-type="application/pdf"></action-text-attachment>`
+	urls := ExtractImageURLs(h)
+	if len(urls) != 2 {
+		t.Fatalf("ExtractImageURLs Action Text got %d urls, want 2", len(urls))
+	}
+	if urls[0] != "/rails/blobs/photo.png" {
+		t.Errorf("url[0] = %q, want %q", urls[0], "/rails/blobs/photo.png")
+	}
+	if urls[1] != "https://gopher.hey.com/signed/photo.jpg" {
+		t.Errorf("url[1] = %q, want Gopher image", urls[1])
+	}
+}
+
+// Decorative images — avatars, icons, tracking pixels declaring icon-sized
+// dimensions — are not extracted: a digest email carries hundreds of them ahead of
+// its screenshots, and each request would come out of the viewer's image budget.
+func TestExtractImageURLsSkipsDecorativeImages(t *testing.T) {
+	h := `<img src="https://mailer.example.com/open?id=8fd3" width="1" height="1">
+<action-text-attachment url="https://gopher.hey.com/signed/avatar.png" content-type="image" width="40" height="40" caption="Michelle Harjani"><figure><img src="https://gopher.hey.com/signed/avatar-rendered.png"></figure></action-text-attachment>
+<action-text-attachment url="https://gopher.hey.com/signed/screenshot.png" content-type="image"></action-text-attachment>`
+	urls := ExtractImageURLs(h)
+	if len(urls) != 1 || urls[0] != "https://gopher.hey.com/signed/screenshot.png" {
+		t.Errorf("ExtractImageURLs = %v, want only the screenshot", urls)
+	}
+}
+
+func TestToTextSkipsDecorativeImages(t *testing.T) {
+	got := ToText(`<p>Michelle commented<img src="https://gopher.hey.com/signed/avatar.png" width="40" height="40"></p>`)
+	if strings.Contains(got, "[image]") {
+		t.Errorf("ToText should skip a decorative image, got %q", got)
+	}
+	if !strings.Contains(got, "Michelle commented") {
+		t.Errorf("ToText should keep the surrounding text, got %q", got)
+	}
+}
+
+func TestToTextSkipsDecorativeImageAttachments(t *testing.T) {
+	got := ToText(`<p>Kevin commented</p><action-text-attachment content-type="image" url="https://gopher.hey.com/signed/avatar.png" filename="kevin.png" width="20" height="20"></action-text-attachment>`)
+	if strings.Contains(got, "kevin.png") {
+		t.Errorf("ToText should skip a decorative image attachment, got %q", got)
+	}
+	if !strings.Contains(got, "Kevin commented") {
+		t.Errorf("ToText should keep the surrounding text, got %q", got)
+	}
+}
+
+func TestExtractImageURLsTrixFigure(t *testing.T) {
+	// The small figure is a named upload, not decoration: its JSON dimensions are the
+	// file's intrinsic size, so the decorative-image rule does not apply to figures.
+	h := `<figure data-trix-attachment='{"url":"/rails/blobs/abc/image.png","filename":"image.png","contentType":"image/png"}'></figure>
+<figure data-trix-attachment='{"url":"/rails/blobs/abc/pixel-icon.png","filename":"pixel-icon.png","contentType":"image/png","width":32,"height":32}'></figure>
+<figure data-trix-attachment='{"url":"/rails/blobs/abc/report.pdf","filename":"report.pdf","contentType":"application/pdf"}'></figure>`
+	urls := ExtractImageURLs(h)
+	if len(urls) != 2 {
+		t.Fatalf("ExtractImageURLs trix got %d urls, want 2", len(urls))
+	}
+	if urls[0] != "/rails/blobs/abc/image.png" {
+		t.Errorf("url[0] = %q, want %q", urls[0], "/rails/blobs/abc/image.png")
+	}
+	if urls[1] != "/rails/blobs/abc/pixel-icon.png" {
+		t.Errorf("url[1] = %q, want the named small upload", urls[1])
+	}
+}
+
+func TestToTextRendersInlineHTMLTrixAttachments(t *testing.T) {
+	// HEY wraps pasted rich HTML in text/html trix attachments: the markup
+	// sits inside the JSON attribute, and the figure element has no children.
+	content := `<figure data-trix-attachment="{&quot;contentType&quot;:&quot;text/html&quot;,&quot;content&quot;:&quot;<shadow-content><template><p>Please join us for the parent retreat on Saturday.</p></template></shadow-content>&quot;,&quot;data&quot;:&quot;{}&quot;}"></figure>` +
+		`<figure data-trix-attachment="{&quot;contentType&quot;:&quot;text/html&quot;,&quot;content&quot;:&quot;<shadow-content><template><p>RSVP to maria.gonzalez@example.org by Friday.</p></template></shadow-content>&quot;,&quot;data&quot;:&quot;{}&quot;}"></figure>`
+
+	got := ToText(content)
+	if !strings.Contains(got, "Please join us for the parent retreat on Saturday.") {
+		t.Errorf("ToText dropped the first inline HTML segment: %q", got)
+	}
+	if !strings.Contains(got, "RSVP to maria.gonzalez@example.org by Friday.") {
+		t.Errorf("ToText dropped the second inline HTML segment: %q", got)
+	}
+}
+
+func TestToTextKeepsFileAttachmentPlaceholders(t *testing.T) {
+	content := `<figure data-trix-attachment="{&quot;contentType&quot;:&quot;application/pdf&quot;,&quot;filename&quot;:&quot;retreat-schedule.pdf&quot;,&quot;url&quot;:&quot;/attachments/12&quot;}"></figure>`
+	if got := ToText(content); !strings.Contains(got, "[retreat-schedule.pdf]") {
+		t.Errorf("ToText should keep the filename placeholder: %q", got)
+	}
+}

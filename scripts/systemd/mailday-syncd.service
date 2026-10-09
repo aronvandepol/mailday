@@ -1,0 +1,17 @@
+[Unit]
+Description=Mailday live mail sync (IMAP IDLE + mbsync)
+Documentation=https://github.com/aronvandepol/mailday
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# PassCmd runs gpg or an OAuth helper; notify-send shows new mail.
+Environment=PATH=%h/.local/share/mise/shims:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=GPG_TTY=
+ExecStart=%h/.local/bin/mailday-syncd
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

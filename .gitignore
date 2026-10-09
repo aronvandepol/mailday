@@ -1,0 +1,8 @@
+/bin/
+/mailday
+/reference/hey-omarchy/
+/coverage.out
+*.prof
+__pycache__/
+*.pyc
+demo-home/

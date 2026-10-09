@@ -1,0 +1,31 @@
+Return-Path: <>
+From: =?UTF-8?Q?Ada_Lovelace?= <ada@example.org>
+To: hello@samdevries.example
+Subject: Return Receipt (displayed) - Lunch on Friday?
+Date: Wed, 8 Oct 2025 09:15:44 +0100
+Message-ID: <7e2a1f3c-5d44-4b0e-9a55-0c6a1a8d2b90@example.org>
+User-Agent: Mozilla Thunderbird
+MIME-Version: 1.0
+Content-Type: multipart/report; report-type=disposition-notification;
+ boundary="------------Zk0ZnCm8Q3Vb3aR1H5tWf4mL"
+
+--------------Zk0ZnCm8Q3Vb3aR1H5tWf4mL
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 7bit
+
+This is a Return Receipt for the mail that you sent to ada@example.org.
+
+Note: This Return Receipt only acknowledges that the message was displayed on the recipient's computer. There is no guarantee that the recipient has read or understood the message contents.
+
+--------------Zk0ZnCm8Q3Vb3aR1H5tWf4mL
+Content-Type: message/disposition-notification; name="MDNPart2.txt"
+Content-Disposition: inline
+Content-Transfer-Encoding: 7bit
+
+Reporting-UA: ; Mozilla Thunderbird 128.3.0
+Original-Recipient: rfc822;ada@example.org
+Final-Recipient: rfc822;ada@example.org
+Original-Message-ID: <1759910000000000000.0011223344556677@samdevries.example>
+Disposition: manual-action/MDN-sent-manually; displayed
+
+--------------Zk0ZnCm8Q3Vb3aR1H5tWf4mL--

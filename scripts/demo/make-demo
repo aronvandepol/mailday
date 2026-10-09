@@ -1,0 +1,763 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""Build a self-contained fictional home directory for Mailday screenshots.
+
+    scripts/demo/make-demo DIR [--now 2026-10-14T09:30] [--force]
+
+Everything is invented: the persona Alex Morgan, two accounts (work and
+personal), about 36 messages from the last 12 days, and two ICS calendars
+around "now". Only *.example domains appear, and nothing contacts a server.
+Dates are relative to --now (default: the current time), in the machine's
+local zone, so a fixed --now reproduces a screenshot.
+"""
+from __future__ import annotations
+
+import subprocess
+import shlex
+import argparse
+import itertools
+import os
+import shutil
+import sys
+from datetime import datetime, timedelta, timezone
+from email.headerregistry import Address
+from email.message import EmailMessage
+from email.utils import format_datetime
+from pathlib import Path
+
+MARKER = ".mailday-demo"
+WORK = "alex.morgan@northwind.example"
+HOME_ADDR = "alex@morgan.example"
+
+
+# --------------------------------------------------------------------------
+# time helpers
+
+class Clock:
+    def __init__(self, now: datetime):
+        self.now = now
+        self.today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def at(self, days: int, hh: int, mm: int = 0) -> datetime:
+        """Local wall-clock time `days` from today (negative = past)."""
+        base = self.today + timedelta(days=days)
+        return base.replace(hour=hh, minute=mm)
+
+    def past(self, days_ago: int, hh: int, mm: int = 0) -> datetime:
+        """A message time, never later than now."""
+        when = self.at(-days_ago, hh, mm)
+        if when >= self.now:
+            when = self.now - timedelta(minutes=7 + 11 * (hh % 5))
+        return when
+
+
+def local_ics(dt: datetime) -> str:
+    return dt.strftime("%Y%m%dT%H%M%S")
+
+
+def utc_ics(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+# --------------------------------------------------------------------------
+# mail
+
+_counter = itertools.count(1)
+
+
+def addr(name: str, email: str) -> Address:
+    user, domain = email.split("@")
+    return Address(display_name=name, username=user, domain=domain)
+
+
+def tiny_pdf(title: str, line: str) -> bytes:
+    """A one-page PDF with correct xref offsets."""
+    stream = f"BT /F1 18 Tf 72 720 Td ({title}) Tj 0 -28 Td /F1 11 Tf ({line}) Tj ET"
+    objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        "/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+        f"<< /Length {len(stream)} >>\nstream\n{stream}\nendstream",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    out = b"%PDF-1.4\n"
+    offsets = []
+    for number, body in enumerate(objects, 1):
+        offsets.append(len(out))
+        out += f"{number} 0 obj\n{body}\nendobj\n".encode("latin-1")
+    xref = len(out)
+    out += f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode()
+    for offset in offsets:
+        out += f"{offset:010d} 00000 n \n".encode()
+    out += (f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+            f"startxref\n{xref}\n%%EOF\n").encode()
+    return out
+
+
+class Mail:
+    def __init__(self, root: Path):
+        self.root = root
+
+    def maildir(self, account: str, box: str) -> Path:
+        path = self.root / account / box
+        for leaf in ("cur", "new", "tmp"):
+            (path / leaf).mkdir(parents=True, exist_ok=True)
+        return path
+
+    def put(self, account: str, box: str, msg: EmailMessage, when: datetime,
+            seen: bool = True, flags: str = "") -> None:
+        """Write msg into account/box. Unseen mail goes to new/ without flags."""
+        folder = self.maildir(account, box)
+        stamp = int(when.timestamp())
+        base = f"{stamp}.M{next(_counter)}P4242.demo"
+        if seen:
+            path = folder / "cur" / f"{base}:2,{''.join(sorted(set(flags + 'S')))}"
+        else:
+            path = folder / "new" / base
+        path.write_bytes(msg.as_bytes())
+        os.utime(path, (stamp, stamp))
+
+
+def build(sender: Address, to: list[Address], subject: str, body: str, when: datetime,
+          msgid: str, reply_to: str | None = None, references: list[str] | None = None,
+          cc: list[Address] | None = None) -> EmailMessage:
+    msg = EmailMessage()
+    msg["From"] = sender
+    msg["To"] = to
+    if cc:
+        msg["Cc"] = cc
+    msg["Subject"] = subject
+    msg["Date"] = format_datetime(when)
+    msg["Message-ID"] = f"<{msgid}>"
+    if reply_to:
+        msg["In-Reply-To"] = f"<{reply_to}>"
+    if references:
+        msg["References"] = " ".join(f"<{r}>" for r in references)
+    msg.set_content(body)
+    return msg
+
+
+def quote(text: str) -> str:
+    return "\n".join("> " + line if line else ">" for line in text.strip().splitlines())
+
+
+def populate_mail(mail: Mail, clock: Clock) -> None:
+    alex_w = addr("Alex Morgan", WORK)
+    alex_h = addr("Alex Morgan", HOME_ADDR)
+    P = clock.past
+
+    for account, boxes in {
+        "work": ["Inbox", "@Reply", "@Waiting", "@Clients", "@Hiring", "Sent", "Archive", "Trash"],
+        "personal": ["Inbox", "@Reply", "@Waiting", "@Travel", "Sent", "Archive", "Trash"],
+    }.items():
+        for box in boxes:
+            mail.maildir(account, box)
+
+    # ---- client thread: Brightwater Foods, packaging round 2 -------------
+    marta = addr("Marta Okafor", "marta.okafor@brightwater.example")
+    t_a, t_b, t_c, t_d, t_e = (f"{n}@brightwater.example" for n in
+                                ("pk2-a.8841", "pk2-b.8842", "pk2-c.8843", "pk2-d.8844", "pk2-e.8845"))
+    a_time, b_time = P(9, 10, 12), P(9, 14, 40)
+    c_time, d_time, e_time = P(7, 9, 5), P(7, 11, 30), P(1, 16, 20)
+    subject = "Brand refresh: packaging round 2"
+
+    a_body = (
+        "Hi Alex,\n\nThe team went through the second round of packaging directions this "
+        "morning. Short version: everyone likes direction B (the cut-paper pattern), but "
+        "the green on the oat range reads too close to a competitor's shelf presence.\n\n"
+        "Could you send two alternative greens and a note on how the pattern scales to the "
+        "smaller 250g carton? We would like to lock this before the retail meeting.\n\n"
+        "Thanks,\nMarta\n\n--\nMarta Okafor | Head of Brand, Brightwater Foods\n")
+    mail.put("work", "@Clients", build(marta, [alex_w], subject, a_body, a_time, t_a), a_time)
+
+    b_body = (
+        "Hi Marta,\n\nThanks for the clear steer. I will send two greens (a deeper pine and "
+        "a lighter sage) with swatches on the real board stock, plus a scaling study for the "
+        "250g carton by Monday.\n\nOne question: is the retail meeting still on the 22nd?\n\n"
+        "Best,\nAlex\n\nAlex Morgan\nDesign Lead · Northwind Studio\nnorthwind.example\n")
+    b_when = b_time
+    mail.put("work", "Sent", build(alex_w, [marta], "Re: " + subject, b_body, b_when, t_b,
+                                   t_a, [t_a]), b_when)
+
+    c_body = (
+        "Thanks Alex, the retail meeting moved to the 24th, so we have a couple of extra "
+        "days. Monday is still great.\n\nWe also want to see the oat carton next to the "
+        "existing range, if you can mock that up.\n\nMarta\n\n"
+        f"On {b_time.strftime('%a %d %b')}, Alex Morgan wrote:\n{quote(b_body)}\n")
+    mail.put("work", "@Clients", build(marta, [alex_w], "Re: " + subject, c_body, c_time, t_c,
+                                       t_b, [t_a, t_b]), c_time, flags="R")
+
+    d_body = (
+        "Marta,\n\nUnderstood. I will put the oat carton next to the current range on one "
+        "board, with the new sage and pine side by side.\n\nAlex\n\nAlex Morgan\n"
+        "Design Lead · Northwind Studio\nnorthwind.example\n")
+    mail.put("work", "Sent", build(alex_w, [marta], "Re: " + subject, d_body, d_time, t_d,
+                                   t_c, [t_a, t_b, t_c]), d_time)
+
+    e_body = (
+        "Alex, the boards look great. Pine wins for us on the oat range, and the pattern "
+        "holds up on the small carton better than I expected.\n\nTwo small things before "
+        "we sign off: can the leaf mark sit 2mm lower, and can legal's line move to the "
+        "back panel? Notes are in the PDF from Finn on our side, I will forward it.\n\n"
+        "Marta\n\n"
+        f"On {d_time.strftime('%a %d %b')} at {d_time.strftime('%H:%M')}, Alex Morgan wrote:\n"
+        f"{quote(d_body)}\n\n"
+        f"On {c_time.strftime('%a %d %b')} at {c_time.strftime('%H:%M')}, Marta Okafor wrote:\n"
+        f"{quote(c_body.split('On ')[0])}\n")
+    mail.put("work", "Inbox", build(marta, [alex_w], "Re: " + subject, e_body, e_time, t_e,
+                                    t_d, [t_a, t_b, t_c, t_d]), e_time, seen=False)
+
+    # ---- newsletter (HTML) ------------------------------------------------
+    news_time = P(2, 7, 45)
+    news = EmailMessage()
+    news["From"] = addr("Grid & Type Weekly", "editor@gridweekly.example")
+    news["To"] = alex_w
+    news["Subject"] = "Grid & Type Weekly #148: variable fonts in the wild"
+    news["Date"] = format_datetime(news_time)
+    news["Message-ID"] = "<issue-148@gridweekly.example>"
+    news["List-Unsubscribe"] = "<https://gridweekly.example/unsubscribe>"
+    news.set_content(
+        "Grid & Type Weekly #148\n\nThis week: variable fonts in the wild\n\n"
+        "1. Why variable fonts finally ship in product UI - https://example.com/articles/variable-fonts\n"
+        "2. A field guide to optical sizes - https://example.com/articles/optical-sizes\n"
+        "3. Layout grids for dense dashboards - https://example.com/articles/dense-grids\n"
+        "4. Reader mail: tabular figures, again - https://example.com/articles/tabular-figures\n\n"
+        "Until next week,\nThe Grid & Type team\n")
+    news.add_alternative("""<!doctype html>
+<html><body style="font-family: Georgia, serif; max-width: 560px; margin: 0 auto; color: #222;">
+<img src="https://example.com/img/gridweekly-148-hero.jpg" alt="A specimen sheet of a variable font, weights sliding from thin to black" width="560">
+<h1>Grid &amp; Type Weekly</h1>
+<h2>Issue 148: variable fonts in the wild</h2>
+<p>Product teams have been quietly adopting variable fonts. This week we look at what
+they gained, what broke, and the three settings worth knowing about.</p>
+<h3>This week&rsquo;s reading</h3>
+<ul>
+  <li><a href="https://example.com/articles/variable-fonts">Why variable fonts finally ship in product UI</a></li>
+  <li><a href="https://example.com/articles/optical-sizes">A field guide to optical sizes</a></li>
+  <li><a href="https://example.com/articles/dense-grids">Layout grids for dense dashboards</a></li>
+  <li><a href="https://example.com/articles/tabular-figures">Reader mail: tabular figures, again</a></li>
+</ul>
+<h3>Tool of the week</h3>
+<p><img src="https://example.com/img/kerning-tool.png" alt="Screenshot of a kerning pair inspector"><br>
+A small inspector that shows every kerning pair a font applies to the word you typed.</p>
+<p><em>Until next week,<br>The Grid &amp; Type team</em></p>
+<p style="font-size: 12px; color: #777;"><a href="https://gridweekly.example/unsubscribe">Unsubscribe</a></p>
+</body></html>""", subtype="html")
+    mail.put("work", "Inbox", news, news_time)
+
+    # ---- code-forge notification -----------------------------------------
+    gh_time = P(0, 8, 52)
+    gh = build(addr("Priya Raman (via Forge)", "notifications@forge.example"), [alex_w],
+               "[northwind/design-tokens] Add spacing scale for dense tables (PR #212)",
+               "priya-raman requested your review on this pull request.\n\n"
+               "  Add spacing scale for dense tables\n"
+               "  northwind/design-tokens #212\n\n"
+               "  + space-1 .. space-8 now follow a 4px base\n"
+               "  + table-dense preset uses space-2 / space-3\n"
+               "  - removes the legacy 6px gutter alias\n\n"
+               "Reply to this email directly or view it on Forge:\n"
+               "https://forge.example/northwind/design-tokens/pull/212\n\n"
+               "You are receiving this because your review was requested.\n",
+               gh_time, "northwind/design-tokens/pull/212@forge.example")
+    mail.put("work", "Inbox", gh, gh_time, seen=False)
+
+    # ---- calendar invitation ---------------------------------------------
+    inv_time = P(1, 10, 15)
+    start, end = clock.at(2, 14, 0), clock.at(2, 15, 0)
+    ics = "\r\n".join([
+        "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Northwind//Calendar//EN", "METHOD:REQUEST",
+        "BEGIN:VEVENT",
+        "UID:q4-roadmap-review-2041@northwind.example",
+        f"DTSTAMP:{utc_ics(inv_time)}",
+        f"DTSTART:{utc_ics(start)}", f"DTEND:{utc_ics(end)}",
+        "SEQUENCE:0",
+        "SUMMARY:Q4 Roadmap Review",
+        "LOCATION:Studio B (second floor)",
+        "DESCRIPTION:Walk through the Q4 priorities and agree what we drop.\\nPlease skim the roadmap board first.",
+        "ORGANIZER;CN=Priya Raman:mailto:priya.raman@northwind.example",
+        f"ATTENDEE;CN=Alex Morgan;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{WORK}",
+        "ATTENDEE;CN=Lena Fischer;ROLE=REQ-PARTICIPANT;PARTSTAT=ACCEPTED:mailto:lena.fischer@northwind.example",
+        "ATTENDEE;CN=Tom Whitaker;ROLE=REQ-PARTICIPANT;PARTSTAT=ACCEPTED:mailto:tom.whitaker@northwind.example",
+        "STATUS:CONFIRMED", "TRANSP:OPAQUE",
+        "END:VEVENT", "END:VCALENDAR", ""])
+    inv = build(addr("Priya Raman", "priya.raman@northwind.example"), [alex_w],
+                "Invitation: Q4 Roadmap Review", "Priya Raman invited you to Q4 Roadmap Review.\n\n"
+                f"When: {start.strftime('%A %d %B, %H:%M')}-{end.strftime('%H:%M')}\n"
+                "Where: Studio B (second floor)\n", inv_time, "inv-q4-roadmap@northwind.example")
+    inv.add_alternative(ics, subtype="calendar", params={"method": "REQUEST"})
+    mail.put("work", "Inbox", inv, inv_time, seen=False)
+
+    # ---- PDF attachment ----------------------------------------------------
+    pdf_time = P(3, 13, 22)
+    pdf = build(addr("Daniel Reyes", "daniel.reyes@northwind.example"), [alex_w],
+                "Invoice NW-2041 and statement of work",
+                "Hi Alex,\n\nAttached is the signed statement of work for the Brightwater "
+                "packaging phase, with invoice NW-2041 for the first milestone. Please "
+                "check the milestone dates before I send it to the client.\n\nDaniel\n",
+                pdf_time, "sow-2041@northwind.example")
+    pdf.add_attachment(tiny_pdf("Statement of Work - Brightwater packaging",
+                                "Invoice NW-2041, milestone 1"),
+                       maintype="application", subtype="pdf", filename="SOW-Brightwater-NW-2041.pdf")
+    mail.put("work", "Inbox", pdf, pdf_time)
+
+    # ---- non-ASCII senders -------------------------------------------------
+    z_time = P(0, 7, 58)
+    mail.put("work", "Inbox", build(
+        addr("Zoë Lambert", "zoe.lambert@lambertwords.example"), [alex_w], "Landing page copy, v3",
+        "Hi Alex,\n\nv3 of the Brightwater landing page copy is in the shared folder. I "
+        "shortened the hero to two lines and moved the sourcing story below the fold, "
+        "as discussed.\n\nTell me where the layout needs fewer words and I will cut.\n\nZoë\n",
+        z_time, "copy-v3@lambertwords.example"), z_time, seen=False)
+
+    s_time = P(5, 15, 10)
+    mail.put("work", "@Clients", build(
+        addr("Søren Dahl", "soren@dahlphoto.example"), [alex_w],
+        "Photo selects for the Harbor Café shoot",
+        "Alex,\n\nSelects are up: 42 frames from the morning light, 18 from the late "
+        "afternoon. The ones with the steam off the cups are my favourites. Raw files "
+        "follow once you have picked.\n\nSøren\n",
+        s_time, "selects-harbor@dahlphoto.example"), s_time)
+
+    # ---- hiring ------------------------------------------------------------
+    k_time = P(4, 11, 3)
+    mail.put("work", "@Hiring", build(
+        addr("김하늘", "hanul.kim@studio-hana.example"), [alex_w],
+        "Application: Senior Product Designer",
+        "Hello Alex,\n\nI would like to apply for the Senior Product Designer role. My "
+        "portfolio is at https://example.com/hanul and includes two case studies on "
+        "design systems for dense data products.\n\nThank you for your time.\n\nHaneul Kim\n",
+        k_time, "app-hanul@studio-hana.example"), k_time, seen=False)
+    h_time = P(6, 9, 40)
+    mail.put("work", "@Hiring", build(
+        addr("Hannah Brooks", "hannah.brooks@northwind.example"), [alex_w],
+        "Portfolio shortlist: 4 candidates",
+        "Alex, four portfolios made my shortlist for Senior Product Designer. Links and "
+        "my notes are in the hiring sheet. Could you rank them before Friday?\n\nHannah\n",
+        h_time, "shortlist@northwind.example"), h_time, flags="F")
+    r_time = P(2, 16, 30)
+    mail.put("work", "@Hiring", build(
+        addr("Ravi Menon", "ravi.menon@northwind.example"), [alex_w, addr("Hannah Brooks", "hannah.brooks@northwind.example")],
+        "Interview panel for Thursday", "Panel for Thursday: you, me and Lena. 45 minutes "
+        "each, with a 15 minute portfolio walk-through at the start. Room: Studio A.\n\nRavi\n",
+        r_time, "panel@northwind.example"), r_time)
+
+    # ---- @Reply and @Waiting ----------------------------------------------
+    t1 = P(1, 14, 5)
+    mail.put("work", "@Reply", build(
+        addr("Lena Fischer", "lena.fischer@northwind.example"), [alex_w],
+        "Can you review the onboarding flow before Thursday?",
+        "Hey Alex, the new onboarding flow is in Figma. Could you review the empty states "
+        "and the first-run tooltips before Thursday's critique?\n\nLena\n",
+        t1, "onboarding@northwind.example"), t1, seen=False)
+    t2 = P(3, 17, 12)
+    mail.put("work", "@Reply", build(
+        addr("Tom Whitaker", "tom.whitaker@northwind.example"), [alex_w],
+        "Quick question on icon licensing",
+        "Is the icon set we bought covering client work, or just internal tools? I need "
+        "to answer a procurement question for Brightwater.\n\nTom\n",
+        t2, "icons@northwind.example"), t2)
+    t3 = P(8, 16, 48)
+    mail.put("work", "@Reply", build(
+        addr("Priya Raman", "priya.raman@northwind.example"), [alex_w], "Moodboard feedback?",
+        "Did you get a chance to look at the moodboard for the Harbor Café refresh? I would "
+        "like to send it to the client on Wednesday.\n\nPriya\n",
+        t3, "moodboard@northwind.example"), t3, flags="F")
+    w1 = P(5, 10, 20)
+    mail.put("work", "@Waiting", build(
+        addr("Okonkwo Print", "quotes@okonkwoprint.example"), [alex_w],
+        "Quote 7731: carton prototypes, 3 variants",
+        "Hello Alex, we can run three carton prototypes on 350gsm board with spot UV. "
+        "Pricing is attached to the portal entry. Lead time is 6 working days after "
+        "artwork approval.\n\nOkonkwo Print\n", w1, "quote-7731@okonkwoprint.example"), w1)
+    w2 = P(10, 11, 55)
+    mail.put("work", "@Waiting", build(
+        addr("Typefoundry Support", "support@typefoundry.example"), [alex_w],
+        "Re: Desktop and web licence for Lumen Sans",
+        "Thanks for your question. A multi-seat licence for 14 users with a web licence "
+        "for up to 500k page views is quoted separately. We will send the revised quote "
+        "once finance confirms.\n\nSupport team\n", w2, "lic-lumen@typefoundry.example"), w2)
+
+    # ---- other Inbox ---------------------------------------------------------
+    i1 = P(2, 12, 0)
+    mail.put("work", "Inbox", build(
+        addr("Jess Calloway", "jess.calloway@northwind.example"), [addr("Studio", "studio@northwind.example")],
+        "Friday studio lunch: dietary notes", "Booking the long table at the market hall for "
+        "Friday 12:30. Reply with dietary notes by Thursday noon.\n\nJess\n",
+        i1, "lunch@northwind.example"), i1)
+    i2 = P(0, 8, 20)
+    mail.put("work", "Inbox", build(
+        addr("Northwind IT", "it@northwind.example"), [alex_w], "Reminder: renew your laptop encryption key",
+        "Your disk encryption recovery key expires in 7 days. Open Settings, Security, "
+        "and choose Renew. This takes about two minutes.\n\nIT\n",
+        i2, "it-key@northwind.example"), i2, seen=False)
+
+    # ---- Sent (extra) ----------------------------------------------------------
+    for days, hh, mm, to, subj, body, mid in [
+        (4, 17, 42, addr("Priya Raman", "priya.raman@northwind.example"), "Re: Moodboard feedback?",
+         "Priya, looked at it this afternoon. Direction two is the strongest. Can we add "
+         "one more reference with warmer light before it goes out?\n\nAlex", "sent-mb@northwind.example"),
+        (3, 10, 3, addr("Tom Whitaker", "tom.whitaker@northwind.example"), "Re: Quick question on icon licensing",
+         "Tom, the licence covers client work for up to 10 products. I attached the "
+         "relevant paragraph in the previous thread. Happy to confirm with the vendor.\n\nAlex",
+         "sent-icons@northwind.example"),
+    ]:
+        when = P(days, hh, mm)
+        mail.put("work", "Sent", build(alex_w, [to], subj, body + "\n", when, mid), when)
+
+    # ---- Archive / Trash ------------------------------------------------------
+    for days, hh, sender, subj, body, mid in [
+        (11, 9, addr("Northwind Studio", "hello@northwind.example"), "Welcome, Jordan Ellis",
+         "Please welcome Jordan Ellis, joining us as a visual designer on Monday.", "welcome@northwind.example"),
+        (9, 15, addr("Facilities", "facilities@northwind.example"), "Studio closed Friday for floor sanding",
+         "The studio is closed on Friday morning for floor sanding. Work from home or the café downstairs.", "floor@northwind.example"),
+        (12, 8, addr("Jess Calloway", "jess.calloway@northwind.example"), "October all-hands: agenda",
+         "Agenda: studio results, hiring, the Brightwater project, open Q&A.", "allhands@northwind.example"),
+    ]:
+        when = P(days, hh, 12)
+        mail.put("work", "Archive", build(sender, [alex_w], subj, body + "\n", when, mid), when)
+    when = P(6, 6, 30)
+    mail.put("work", "Trash", build(addr("Stockphoto Deals", "offers@stockphoto.example"), [alex_w],
+                                    "Last chance: 40% off image packs", "Sale ends tonight.\n", when,
+                                    "deal@stockphoto.example"), when)
+
+    # ---- personal ---------------------------------------------------------------
+    jamie = addr("Jamie Morgan", "jamie@morgan.example")
+    when = P(0, 7, 12)
+    mail.put("personal", "Inbox", build(jamie, [alex_h], "Saturday dinner?",
+             "Hey, are you around Saturday? Thinking of the new Italian place near the canal, "
+             "7:30. Bring a bottle if you are coming.\n\nJ\n", when, "dinner@morgan.example"),
+             when, seen=False)
+    when = P(0, 8, 31)
+    mail.put("personal", "Inbox", build(addr("Sam Whitfield", "sam@whitfield.example"), [alex_h],
+             "Climbing Thursday?", "Wall is quiet on Thursday evenings. 18:30? I will bring the "
+             "good chalk.\n\nSam\n", when, "climb@whitfield.example"), when, seen=False)
+    when = P(2, 9, 0)
+    mail.put("personal", "Inbox", build(addr("Fennel Bank", "no-reply@fennelbank.example"), [alex_h],
+             "Your statement for October is ready", "Your October statement is ready in the "
+             "app. This message holds no account details.\n", when, "stmt@fennelbank.example"), when)
+    when = P(3, 18, 5)
+    mail.put("personal", "Inbox", build(addr("Ironworks Gym", "hello@ironworksgym.example"), [alex_h],
+             "New class timetable from Monday", "Evening strength classes move to 18:15 from "
+             "Monday. Mobility moves to Saturday.\n", when, "tt@ironworksgym.example"), when)
+    when = P(1, 19, 40)
+    mail.put("personal", "@Reply", build(addr("Mira Kowalski", "mira@kowalski.example"), [alex_h],
+             "Can you recommend a framer?", "You mentioned a framer you liked. Name?\n\nMira\n",
+             when, "framer@kowalski.example"), when, seen=False)
+    when = P(4, 12, 0)
+    mail.put("personal", "@Waiting", build(addr("Bright Plumbing", "office@brightplumbing.example"), [alex_h],
+             "Booking confirmed: boiler service", "We will visit next Tuesday between 8 and 12 "
+             "for the annual boiler service. The engineer will call first.\n", when,
+             "boiler@brightplumbing.example"), when)
+
+    # travel
+    when = P(7, 20, 15)
+    mail.put("personal", "@Travel", build(addr("Northline Rail", "tickets@northlinerail.example"), [alex_h],
+             "Your e-ticket: Northgate to Linden Cross", "Booking ref NR-48213.\nOutbound: "
+             f"{clock.at(9, 8, 14).strftime('%a %d %b')}, 08:14 Northgate - 11:02 Linden Cross, "
+             "coach C seat 41.\nReturn: open.\n", when, "ticket@northlinerail.example"), when)
+    when = P(7, 20, 30)
+    mail.put("personal", "@Travel", build(addr("Casa Verde Hotel", "reservations@casaverde.example"), [alex_h],
+             "Reservation confirmed: 2 nights", "We look forward to welcoming you. Check-in "
+             "from 15:00, breakfast 7:30 to 10:30. Free cancellation until 48 hours before.\n",
+             when, "res@casaverde.example"), when, flags="F")
+
+    # sent / archive / trash
+    when = P(0, 7, 40)
+    mail.put("personal", "Sent", build(alex_h, [jamie], "Re: Saturday dinner?",
+             "Saturday works. I will book if you pick the place.\n\nAlex\n", when,
+             "re-dinner@morgan.example", "dinner@morgan.example", ["dinner@morgan.example"]), when)
+    when = P(10, 14, 0)
+    mail.put("personal", "Archive", build(addr("Postal Service", "track@postal.example"), [alex_h],
+             "Parcel delivered", "Your parcel was left with a neighbour.\n", when,
+             "parcel@postal.example"), when)
+    when = P(8, 11, 0)
+    mail.put("personal", "Trash", build(addr("Prize Draw", "win@prizes.example"), [alex_h],
+             "You may have won", "Click here.\n", when, "prize@prizes.example"), when)
+
+
+# --------------------------------------------------------------------------
+# calendars
+
+def fold(line: str) -> str:
+    raw = line.encode("utf-8")
+    if len(raw) <= 74:
+        return line
+    parts, current = [], b""
+    for char in line:
+        piece = char.encode("utf-8")
+        limit = 74 if not parts else 73
+        if len(current) + len(piece) > limit:
+            parts.append(current)
+            current = b""
+        current += piece
+    parts.append(current)
+    return "\r\n ".join(p.decode("utf-8") for p in parts)
+
+
+def esc(text: str) -> str:
+    return (text.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,")
+            .replace("\n", "\\n"))
+
+
+class Cal:
+    def __init__(self, name: str, stamp: datetime):
+        self.name = name
+        self.stamp = utc_ics(stamp)
+        self.events: list[list[str]] = []
+        self.n = 0
+
+    def add(self, summary: str, start: datetime | None = None, end: datetime | None = None, *,
+            day: datetime | None = None, days: int = 1, location: str = "",
+            description: str = "", rrule: str = "") -> None:
+        self.n += 1
+        lines = ["BEGIN:VEVENT", f"UID:demo-{self.name.lower()}-{self.n}@morgan.example",
+                 f"DTSTAMP:{self.stamp}"]
+        if day is not None:
+            lines.append(f"DTSTART;VALUE=DATE:{day.strftime('%Y%m%d')}")
+            lines.append(f"DTEND;VALUE=DATE:{(day + timedelta(days=days)).strftime('%Y%m%d')}")
+        else:
+            lines.append(f"DTSTART:{local_ics(start)}")
+            lines.append(f"DTEND:{local_ics(end)}")
+        if rrule:
+            lines.append(f"RRULE:{rrule}")
+        lines.append(f"SUMMARY:{esc(summary)}")
+        if location:
+            lines.append(f"LOCATION:{esc(location)}")
+        if description:
+            lines.append(f"DESCRIPTION:{esc(description)}")
+        lines += ["STATUS:CONFIRMED", "END:VEVENT"]
+        self.events.append(lines)
+
+    def render(self) -> str:
+        head = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Mailday demo//EN",
+                "CALSCALE:GREGORIAN", f"X-WR-CALNAME:{self.name}"]
+        body = [fold(line) for event in self.events for line in event]
+        return "\r\n".join(head + body + ["END:VCALENDAR", ""])
+
+
+def populate_calendars(cal_dir: Path, clock: Clock) -> None:
+    A = clock.at
+    work = Cal("Work", clock.now)
+    home = Cal("Home", clock.now)
+
+    # weekly standup, started a week ago so the past shows too
+    work.add("Design standup", A(-8, 9, 30), A(-8, 9, 45), location="Studio A",
+             rrule="FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR")
+    work.add("Client review: Brightwater", A(0, 11, 0), A(0, 12, 0), location="Zoom",
+             description="Packaging round 2, boards and scaling study.\n"
+                         "Join: https://zoom.example/j/123456789")
+    work.add("Lunch with Lena Fischer", A(0, 12, 30), A(0, 13, 30), location="Café Marlow")
+    work.add("Focus: packaging system", A(0, 14, 0), A(0, 16, 0),
+             description="No meetings. Notifications off.")
+    work.add("1:1 with Priya", A(0, 16, 15), A(0, 16, 45), location="Studio B")
+    work.add("Hiring: portfolio ranking", A(1, 10, 0), A(1, 11, 0), location="Studio A",
+             description="Rank the four shortlisted portfolios with Hannah.")
+    work.add("Design critique", A(1, 15, 0), A(1, 16, 30), location="Studio A")
+    work.add("Q4 Roadmap Review", A(2, 14, 0), A(2, 15, 0), location="Studio B (second floor)",
+             description="Organiser: Priya Raman. Skim the roadmap board first.")
+    work.add("Founders' Day (studio closed)", day=A(3, 0), location="")
+    work.add("Sprint planning", A(5, 10, 0), A(5, 11, 30), location="Studio A")
+    work.add("Photo shoot: Harbor Café", A(6, 8, 0), A(6, 12, 0), location="Harbor Café, Quay Street")
+    work.add("Brightwater retail meeting", A(7, 13, 30), A(7, 15, 0), location="Teams",
+             description="Join: https://teams.example/l/meetup-join/demo-retail")
+    work.add("Interview: Senior Product Designer", A(4, 14, 0), A(4, 14, 45), location="Studio A")
+    work.add("Weekly planning", A(-2, 16, 0), A(-2, 16, 30), location="Studio B")
+
+    home.add("Gym", A(-8, 18, 0), A(-8, 19, 0), location="Ironworks Gym",
+             rrule="FREQ=WEEKLY;BYDAY=MO,WE,FR")
+    home.add("Climbing with Sam", A(1, 18, 30), A(1, 20, 0), location="The Wall")
+    home.add("Dinner with Jamie", A(2, 19, 30), A(2, 21, 30), location="Osteria Bellini")
+    home.add("Boiler service", A(4, 8, 0), A(4, 12, 0), location="Home",
+             description="Engineer calls first.")
+    home.add("Jamie's birthday", day=A(8, 0))
+    home.add("Dentist", A(9, 9, 15), A(9, 10, 0), location="Smile Dental, Mill Lane")
+    home.add("Train to Linden Cross", A(9, 8, 14), A(9, 11, 2), location="Northgate station",
+             description="Booking NR-48213")
+
+    cal_dir.mkdir(parents=True, exist_ok=True)
+    (cal_dir / "Work.ics").write_text(work.render(), encoding="utf-8", newline="")
+    (cal_dir / "Home.ics").write_text(home.render(), encoding="utf-8", newline="")
+
+
+# --------------------------------------------------------------------------
+# config files
+
+def write_configs(root: Path) -> None:
+    cfg = root / ".config" / "mailday"
+    cfg.mkdir(parents=True, exist_ok=True)
+    shared = root / ".local" / "share" / "mailday" / "shared"
+    shared.mkdir(parents=True, exist_ok=True)
+    (cfg / "config.toml").write_text(f'''name = "Alex Morgan"
+shared_dir = "{shared}"
+
+[[identity]]
+accounts = ["work"]
+name = "Alex Morgan"
+address = "{WORK}"
+signature = ["Alex Morgan", "Design Lead · Northwind Studio", "northwind.example"]
+short_signature = ["Alex"]
+save_sent = true
+
+[[identity]]
+accounts = ["personal"]
+name = "Alex Morgan"
+address = "{HOME_ADDR}"
+signature = ["Alex"]
+short_signature = ["Alex"]
+save_sent = true
+
+[mail.box_keys]
+"@Clients" = "c"
+"@Hiring" = "h"
+"@Travel" = "t"
+''', encoding="utf-8")
+
+    (root / ".mbsyncrc").write_text(f'''# Demo only: these hosts do not exist.
+IMAPAccount work
+Host imap.northwind.example
+User {WORK}
+PassCmd "echo demo"
+TLSType IMAPS
+
+IMAPStore work-remote
+Account work
+
+MaildirStore work-local
+Path ~/Mail/work/
+Inbox ~/Mail/work/Inbox
+SubFolders Verbatim
+
+Channel work
+Far :work-remote:
+Near :work-local:
+Patterns *
+Create Near
+SyncState *
+
+IMAPAccount personal
+Host imap.morgan.example
+User {HOME_ADDR}
+PassCmd "echo demo"
+TLSType IMAPS
+
+IMAPStore personal-remote
+Account personal
+
+MaildirStore personal-local
+Path ~/Mail/personal/
+Inbox ~/Mail/personal/Inbox
+SubFolders Verbatim
+
+Channel personal
+Far :personal-remote:
+Near :personal-local:
+Patterns *
+Create Near
+SyncState *
+''', encoding="utf-8")
+
+    msmtp = root / ".config" / "msmtp"
+    msmtp.mkdir(parents=True, exist_ok=True)
+    (msmtp / "config").write_text(f'''# Demo only: nothing here is ever contacted.
+defaults
+auth on
+tls on
+
+account work
+host smtp.northwind.example
+port 587
+from {WORK}
+user {WORK}
+passwordeval echo demo
+
+account personal
+host smtp.morgan.example
+port 587
+from {HOME_ADDR}
+user {HOME_ADDR}
+passwordeval echo demo
+''', encoding="utf-8")
+    for sub in (".local/state", ".cache"):
+        (root / sub).mkdir(parents=True, exist_ok=True)
+
+
+# --------------------------------------------------------------------------
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Build a fictional Mailday demo home directory.")
+    parser.add_argument("dir", help="directory to create")
+    parser.add_argument("--now", help="reference time, local, e.g. 2026-10-14T09:30")
+    parser.add_argument("--force", action="store_true",
+                        help="rebuild DIR if it holds a .mailday-demo marker")
+    args = parser.parse_args()
+
+    root = Path(args.dir).expanduser().resolve()
+    if root.exists() and (not root.is_dir() or any(root.iterdir())):
+        if root.is_dir() and args.force and (root / MARKER).is_file():
+            shutil.rmtree(root)
+        elif args.force:
+            sys.exit(f"make-demo: {root} is not empty and has no {MARKER} marker; refusing to delete it")
+        else:
+            sys.exit(f"make-demo: {root} exists and is not empty (use --force on a demo directory)")
+
+    if args.now:
+        try:
+            now = datetime.fromisoformat(args.now).astimezone()
+        except ValueError:
+            sys.exit(f"make-demo: cannot read --now {args.now!r} (try 2026-10-14T09:30)")
+    else:
+        now = datetime.now().astimezone().replace(second=0, microsecond=0)
+    clock = Clock(now)
+
+    root.mkdir(parents=True, exist_ok=True)
+    (root / MARKER).write_text("Created by scripts/demo/make-demo. Safe to delete or rebuild with --force.\n")
+    write_configs(root)
+    populate_mail(Mail(root / "Mail"), clock)
+    populate_calendars(root / ".local" / "share" / "mailday" / "calendars", clock)
+
+    write_env(root)
+    index_with_notmuch(root)
+
+    messages = sum(1 for p in (root / "Mail").rglob("*") if p.is_file())
+    print(f"Built demo home in {root} ({messages} messages, now = {now:%Y-%m-%d %H:%M %Z})")
+    print()
+    print("Run Mailday against it (nothing reaches your own mail, daemon or calendars):")
+    print(f"  (source {root}/env.sh && mailday)")
+    return 0
+
+
+def write_env(root: Path) -> None:
+    """env.sh points every path Mailday reads into the demo home, including
+    the daemon socket, so a running mailday-syncd of your own is never asked."""
+    theme = Path(__file__).resolve().parent / "theme.toml"
+    values = {
+        "HOME": root, "XDG_CONFIG_HOME": root / ".config", "XDG_DATA_HOME": root / ".local/share",
+        "XDG_STATE_HOME": root / ".local/state", "XDG_CACHE_HOME": root / ".cache",
+        "XDG_RUNTIME_DIR": root / "run", "MAILDAY_CONFIG": root / ".config/mailday/config.toml",
+        "MAILDAY_SYNCD_SOCKET": root / "run/none.sock", "NOTMUCH_CONFIG": root / ".notmuch-config",
+        "MAILDAY_THEME": theme, "MAILDAY_HOME_TZ": "",
+    }
+    (root / "run").mkdir(mode=0o700, exist_ok=True)
+    lines = [f"export {key}={shlex.quote(str(value))}" for key, value in values.items()]
+    (root / "env.sh").write_text("# Source this to run Mailday against the demo home.\n" + "\n".join(lines) + "\n")
+
+
+def index_with_notmuch(root: Path) -> None:
+    """A notmuch index of the demo mail, so / searches bodies too."""
+    if shutil.which("notmuch") is None:
+        return
+    (root / ".notmuch-config").write_text(
+        f"[database]\npath={root / 'Mail'}\n[user]\nname=Alex Morgan\n"
+        "primary_email=alex.morgan@northwind.example\nother_email=alex@morgan.example\n"
+        "[new]\ntags=unread;inbox;\n[search]\nexclude_tags=deleted;spam;\n")
+    env = dict(os.environ, NOTMUCH_CONFIG=str(root / ".notmuch-config"), HOME=str(root))
+    subprocess.run(["notmuch", "new", "--quiet"], env=env, check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

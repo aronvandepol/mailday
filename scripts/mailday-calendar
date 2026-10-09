@@ -1,0 +1,838 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "google-api-python-client>=2.140",
+#   "google-auth-oauthlib>=1.2",
+#   "google-auth>=2.32",
+# ]
+# ///
+"""Create, move, edit and delete calendar events for Mailday.
+
+Settings come from ~/.config/mailday/config.toml (path override:
+$MAILDAY_CONFIG). Google calendars go through the gcal.py-compatible module named
+by [calendar] google_script (a service account with writer access to each
+calendar); the Exchange calendar ([exchange] calendar, default "Outlook") goes
+through EWS with mailday-exchange's token and exists only when [exchange] user
+is set. Every command prints one JSON object and exits
+non-zero on failure, with {"error": ...}.
+
+  mailday-calendar calendars
+  mailday-calendar create --calendar Work --title T --start ISO --end ISO
+                          [--all-day] [--location L] [--notes N]
+  mailday-calendar update --calendar Work --id ID [--title T] [--start ISO --end ISO]
+                          [--all-day | --timed] [--location L] [--notes N]
+  mailday-calendar delete --calendar Work --id ID
+  mailday-calendar transfer --calendar Work --id ID --to Outlook --title T --start ISO --end ISO
+                          [--all-day] [--location L] [--notes N]
+  mailday-calendar respond --calendar Outlook --id ID --answer accept|tentative|decline
+  mailday-calendar login     # once per machine: Google login for invitations
+  mailday-calendar freebusy --attendee ADDRESS [...] --start ISO --end ISO
+                             # when colleagues are busy (Exchange)
+
+Google allows a service account to create and move events but not to
+invite people or answer invitations, so those act as you with gcal.py's
+OAuth token (`login` opens the browser). If the Google Cloud OAuth app is
+in Testing mode, that token lasts 7 days; switch it to In production
+(unverified is fine for one user) to keep it.
+
+create takes --rrule RULE (an RFC 5545 RRULE value such as
+FREQ=WEEKLY;BYDAY=MO;UNTIL=20261220T225959Z) for a repeating event, and
+--attendee ADDRESS (repeatable); the attendees get an
+invitation from Google or Exchange. transfer moves an event to another
+calendar: Google's own move between Google calendars, otherwise a new event
+in the target and the old one deleted (the fields are needed for that).
+respond answers an invitation as you, which tells its organizer.
+
+Times are ISO 8601 with an offset (Mailday sends local time). Everything
+that needs a zone (Google's timeZone, Exchange's zone and recurrence dates,
+free/busy) follows the machine's current zone: $TZ, else /etc/localtime. For --all-day,
+--start and --end are dates and --end is exclusive, as in iCalendar.
+"""
+import argparse, calendar, contextlib, datetime as dt, importlib.machinery, importlib.util, io, json, os, sys, tomllib
+from pathlib import Path
+from xml.sax.saxutils import escape as xml_escape
+from zoneinfo import ZoneInfo
+
+def load_config() -> dict:
+    """Settings from $MAILDAY_CONFIG, else $XDG_CONFIG_HOME/mailday/config.toml,
+    else ~/.config/mailday/config.toml. A missing file means defaults."""
+    explicit = os.environ.get("MAILDAY_CONFIG")
+    base = os.environ.get("XDG_CONFIG_HOME") or "~/.config"
+    path = Path(explicit or Path(base) / "mailday" / "config.toml").expanduser()
+    try:
+        with open(path, "rb") as handle:
+            return tomllib.load(handle)
+    except FileNotFoundError:
+        return {}
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        sys.exit(f"{Path(sys.argv[0]).name}: cannot read {path}: {error}")
+
+
+CONFIG = load_config()
+
+
+def setting(section: str, key: str, default=""):
+    value = (CONFIG.get(section) or {}).get(key)
+    return default if value is None else value
+
+
+GCAL_PATH = os.environ.get("GCAL_SCRIPT") or setting("calendar", "google_script")
+GCAL = Path(GCAL_PATH).expanduser() if GCAL_PATH else None
+EXCHANGE = Path(os.environ.get("MAILDAY_EXCHANGE_SCRIPT", Path(__file__).resolve().parent / "mailday-exchange"))
+EXCHANGE_CALENDAR = setting("exchange", "calendar", "Outlook") or "Outlook"
+DEFAULT_ZONE = setting("calendar", "home_zone") or "UTC"  # only when the machine's zone cannot be found
+
+
+def exchange_user() -> str:
+    return os.environ.get("MAILDAY_EXCHANGE_USER") or setting("exchange", "user")
+
+
+# Exchange names zones the Windows way.
+WINDOWS_ZONES = {
+    **dict.fromkeys(["Europe/Amsterdam", "Europe/Berlin", "Europe/Rome", "Europe/Vienna",
+                     "Europe/Stockholm", "Europe/Oslo", "Europe/Zurich"], "W. Europe Standard Time"),
+    **dict.fromkeys(["Europe/Paris", "Europe/Brussels", "Europe/Madrid", "Europe/Copenhagen"], "Romance Standard Time"),
+    **dict.fromkeys(["Europe/Prague", "Europe/Budapest"], "Central Europe Standard Time"),
+    "Europe/Warsaw": "Central European Standard Time",
+    **dict.fromkeys(["Europe/London", "Europe/Dublin", "Europe/Lisbon"], "GMT Standard Time"),
+    "Asia/Seoul": "Korea Standard Time",
+    "Asia/Tokyo": "Tokyo Standard Time",
+    **dict.fromkeys(["Asia/Shanghai", "Asia/Hong_Kong"], "China Standard Time"),
+    "Asia/Taipei": "Taipei Standard Time",
+    "Asia/Singapore": "Singapore Standard Time",
+    "America/New_York": "Eastern Standard Time",
+    "America/Chicago": "Central Standard Time",
+    "America/Denver": "Mountain Standard Time",
+    "America/Los_Angeles": "Pacific Standard Time",
+    **dict.fromkeys(["UTC", "Etc/UTC"], "UTC"),
+}
+_warned_zones: set[str] = set()
+
+
+def local_zone() -> tuple[str, ZoneInfo]:
+    """The machine's current IANA zone, so the scripts follow a laptop on the
+    road: $TZ, else where /etc/localtime points (Linux and macOS both link into
+    a .../zoneinfo/ tree), else [calendar] home_zone (default UTC)."""
+    candidates = []
+    if os.environ.get("TZ"):
+        candidates.append(os.environ["TZ"].lstrip(":"))
+    _, found, tail = os.path.realpath("/etc/localtime").partition("zoneinfo/")
+    if found:
+        candidates.append(tail)
+    for name in candidates + [DEFAULT_ZONE]:
+        try:
+            return name, ZoneInfo(name)
+        except (KeyError, ValueError, OSError):  # not an IANA name (a POSIX TZ string, say)
+            continue
+    raise RuntimeError("no time zone data: install tzdata")
+
+
+def ews_zone() -> tuple[str, ZoneInfo]:
+    """(Windows zone id, zone) that EWS requests are made in: the local zone,
+    or UTC with a warning (once) when Exchange has no known name for it."""
+    name, zone = local_zone()
+    windows = WINDOWS_ZONES.get(name)
+    if windows is None:
+        if name not in _warned_zones:
+            _warned_zones.add(name)
+            print(f"mailday-calendar: no Windows zone name known for {name}; sending Exchange times in UTC",
+                  file=sys.stderr)
+        return "UTC", ZoneInfo("UTC")
+    return windows, zone
+
+
+def parse_time(value: str, zone: ZoneInfo) -> dt.datetime:
+    """An ISO time; one without an offset is wall clock in zone."""
+    moment = dt.datetime.fromisoformat(value)
+    return moment if moment.tzinfo else moment.replace(tzinfo=zone)
+
+
+def fail(message: str) -> None:
+    print(json.dumps({"error": message}))
+    sys.exit(1)
+
+
+def load(path: Path, name: str):
+    if not path.exists():
+        fail(f"{path} is missing")
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+# ---------------------------------------------------------------- Google
+
+def require_google() -> None:
+    if GCAL is None:
+        fail("no Google calendars are configured: set google_script under [calendar] in "
+             "~/.config/mailday/config.toml")
+
+
+def google(as_user: bool = False):
+    require_google()
+    gcal = load(GCAL, "gcal")
+    if not as_user:
+        return gcal, gcal.service()
+    # gcal.die() exits when the OAuth token is missing or revoked.
+    try:
+        svc = gcal.service(user=True)
+    except SystemExit:
+        note_login("needed")
+        fail("Google invitations and answers act as you and need a login: run `mailday-calendar login` in a terminal")
+    note_login("ok")
+    return gcal, svc
+
+
+def note_login(state: str) -> None:
+    """Record whether the Google login last worked, for `mailday --check`
+    (a token file can exist and still be revoked; only using it tells)."""
+    path = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "mailday" / "google-login"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{state} {dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')}\n")
+    except OSError:
+        pass
+
+
+def google_times(args, patch: bool = False) -> dict:
+    """start/end for an insert or, with patch, an update. Switching between
+    all-day and timed on a patch needs the old key nulled, or Google refuses
+    an event that has both date and dateTime."""
+    body = {}
+    zone_name = local_zone()[0]
+    if args.start:
+        if args.all_day:
+            body["start"] = {"date": args.start[:10]}
+            body["end"] = {"date": args.end[:10]}
+            if patch:
+                body["start"]["dateTime"] = body["end"]["dateTime"] = None
+        else:
+            body["start"] = {"dateTime": args.start, "timeZone": zone_name}
+            body["end"] = {"dateTime": args.end, "timeZone": zone_name}
+            if patch and args.timed:
+                body["start"]["date"] = body["end"]["date"] = None
+    return body
+
+
+def until_date(value: str, zone: ZoneInfo) -> dt.date:
+    """The date in zone that an RRULE UNTIL falls on. A UTC date-time (what
+    Mailday sends) is converted; a plain date or floating time is taken as is."""
+    if "T" not in value or not value.endswith("Z"):
+        return dt.datetime.strptime(value[:8], "%Y%m%d").date()
+    utc = dt.datetime.strptime(value, "%Y%m%dT%H%M%SZ").replace(tzinfo=dt.timezone.utc)
+    return utc.astimezone(zone).date()
+
+
+def google_rrule(rule: str, all_day: bool) -> str:
+    """For an all-day event Google wants UNTIL as a date (RFC 5545 matches it
+    to DTSTART's type); Mailday always sends a UTC date-time."""
+    if not all_day:
+        return rule
+    zone = local_zone()[1]
+    parts = []
+    for part in rule.split(";"):
+        key, _, value = part.partition("=")
+        parts.append(f"UNTIL={until_date(value, zone):%Y%m%d}" if key == "UNTIL" and "T" in value else part)
+    return ";".join(parts)
+
+
+_own = os.environ.get("MAILDAY_GOOGLE_OWN")
+OWN = {a.strip().lower() for a in (_own.split(",") if _own is not None else setting("calendar", "google_own", []))
+       if isinstance(a, str) and a.strip()}
+
+
+def google_create(args) -> dict:
+    gcal, svc = google(as_user=bool(args.attendee))
+    body = {"summary": args.title, **google_times(args)}
+    if args.location:
+        body["location"] = args.location
+    if args.notes:
+        body["description"] = args.notes
+    if args.attendee:
+        body["attendees"] = [{"email": address} for address in args.attendee]
+    if args.rrule:
+        body["recurrence"] = ["RRULE:" + google_rrule(args.rrule, args.all_day)]
+    if getattr(args, "proposal", None):
+        # A proposal is a tentative event the user still has to accept or decline in Mailday (a / x).
+        # mailday-calsync shows it as an unanswered invitation from args.proposal.
+        # Not status "tentative": Google Calendar does not show that state on events you own. A graphite,
+        # free (transparent) event is visible everywhere and blocks nothing until the user accepts it.
+        body["colorId"] = PROPOSAL_COLOR
+        body["transparency"] = "transparent"
+        body["extendedProperties"] = {"private": {PROPOSAL_KEY: args.proposal}}
+        if getattr(args, "proposal_group", None):
+            # alternatives offered together ("Friday or Sunday"): accepting one deletes the others
+            body["extendedProperties"]["private"][GROUP_KEY] = args.proposal_group
+    created = svc.events().insert(calendarId=gcal.CALENDARS[args.calendar], body=body,
+                                  sendUpdates="all" if args.attendee else "none").execute()
+    return {"id": created["id"], "link": created.get("htmlLink", "")}
+
+
+PROPOSAL_KEY = "maildayProposal"
+GROUP_KEY = "maildayProposalGroup"
+PROPOSAL_COLOR = "8"  # Google's graphite
+
+
+def proposal_respond(gcal, svc, calendar_id: str, event: dict, answer: str) -> dict:
+    """Accept, keep or decline one of the user's own proposals (create --proposal)."""
+    if answer == "decline":
+        svc.events().delete(calendarId=calendar_id, eventId=event["id"], sendUpdates="none").execute()
+        return {"id": event["id"], "answer": "declined", "proposal": "deleted"}
+    if answer == "accept":
+        svc.events().patch(calendarId=calendar_id, eventId=event["id"], sendUpdates="none",
+                           body={"status": "confirmed", "colorId": None, "transparency": "opaque",
+                                 "extendedProperties": {"private": {PROPOSAL_KEY: None, GROUP_KEY: None}}}).execute()
+        dropped = []
+        group = (event.get("extendedProperties", {}).get("private", {}) or {}).get(GROUP_KEY)
+        if group:
+            siblings = svc.events().list(calendarId=calendar_id, privateExtendedProperty=f"{GROUP_KEY}={group}",
+                                         showDeleted=False, maxResults=50).execute().get("items", [])
+            for other in siblings:
+                if other["id"] != event["id"] and (other.get("extendedProperties", {}).get("private", {}) or {}).get(PROPOSAL_KEY):
+                    svc.events().delete(calendarId=calendar_id, eventId=other["id"], sendUpdates="none").execute()
+                    dropped.append(other["id"])
+        return {"id": event["id"], "answer": "accepted", "proposal": "confirmed", "alternatives_removed": dropped}
+    return {"id": event["id"], "answer": "tentative", "proposal": "kept"}
+
+
+def proposals_sync(args) -> dict:
+    """Answers given outside Mailday. A proposal whose colour the user changed away from graphite (in Google
+    Calendar, anywhere) is accepted: it becomes busy and keeps that colour, and its alternatives are deleted.
+    Deleting a proposal is already a decline and needs nothing here."""
+    gcal, svc = google()
+    calendar_id = gcal.CALENDARS[args.calendar]
+    accepted, removed = [], []
+    events = []
+    page = None
+    while True:
+        resp = svc.events().list(calendarId=calendar_id, singleEvents=True, maxResults=250, pageToken=page,
+                                 timeMin=(dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)).isoformat()).execute()
+        events += [e for e in resp.get("items", [])
+                   if (e.get("extendedProperties", {}).get("private", {}) or {}).get(PROPOSAL_KEY)]
+        page = resp.get("nextPageToken")
+        if not page:
+            break
+    gone = set()
+    for event in events:
+        if event["id"] in gone or event.get("colorId", PROPOSAL_COLOR) == PROPOSAL_COLOR:
+            continue
+        svc.events().patch(calendarId=calendar_id, eventId=event["id"], sendUpdates="none",
+                           body={"status": "confirmed", "transparency": "opaque",
+                                 "extendedProperties": {"private": {PROPOSAL_KEY: None, GROUP_KEY: None}}}).execute()
+        accepted.append(event.get("summary", event["id"]))
+        group = (event.get("extendedProperties", {}).get("private", {}) or {}).get(GROUP_KEY)
+        for other in events:
+            other_group = (other.get("extendedProperties", {}).get("private", {}) or {}).get(GROUP_KEY)
+            if group and other["id"] != event["id"] and other_group == group and other["id"] not in gone:
+                svc.events().delete(calendarId=calendar_id, eventId=other["id"], sendUpdates="none").execute()
+                gone.add(other["id"])
+                removed.append(other.get("summary", other["id"]))
+    return {"accepted": accepted, "alternatives_removed": removed, "open": len(events) - len(accepted) - len(removed)}
+
+
+def google_respond(args) -> dict:
+    gcal, svc = google()
+    calendar_id = gcal.CALENDARS[args.calendar]
+    try:
+        event = svc.events().get(calendarId=calendar_id, eventId=args.id).execute()
+    except Exception:  # an invitation the service account cannot read: answer it as the user below
+        event = {}
+    if (event.get("extendedProperties", {}).get("private", {}) or {}).get(PROPOSAL_KEY):
+        return proposal_respond(gcal, svc, calendar_id, event, args.answer)
+    gcal, svc = google(as_user=True)
+    event = svc.events().get(calendarId=calendar_id, eventId=args.id).execute()
+    status = {"accept": "accepted", "tentative": "tentative", "decline": "declined"}[args.answer]
+    attendees = event.get("attendees", [])
+    mine = [a for a in attendees if a.get("email", "").lower() in OWN or a.get("self")]
+    if not mine:
+        fail("you are not on this event's guest list")
+    for attendee in mine:
+        attendee["responseStatus"] = status
+    svc.events().patch(calendarId=calendar_id, eventId=args.id, body={"attendees": attendees},
+                       sendUpdates="all").execute()
+    return {"id": args.id, "answer": status}
+
+
+def google_update(args) -> dict:
+    gcal, svc = google(as_user=bool(args.attendee))
+    body = google_times(args, patch=True)
+    if args.title is not None:
+        body["summary"] = args.title
+    if args.location is not None:
+        body["location"] = args.location
+    if args.notes is not None:
+        body["description"] = args.notes
+    if args.attendee:
+        current = svc.events().get(calendarId=gcal.CALENDARS[args.calendar], eventId=args.id).execute()
+        guests = current.get("attendees", [])
+        known = {g.get("email", "").lower() for g in guests}
+        body["attendees"] = guests + [{"email": a} for a in args.attendee if a.lower() not in known]
+    # Attendees (if any) hear about a new time, as in the Google web app.
+    updated = svc.events().patch(calendarId=gcal.CALENDARS[args.calendar], eventId=args.id,
+                                 body=body, sendUpdates="all").execute()
+    return {"id": updated["id"]}
+
+
+def google_delete(args, send_updates: str = "all") -> dict:
+    gcal, svc = google()
+    event_id = args.id
+    if args.series:
+        # An occurrence of a repeating event is <series id>_<start>.
+        event_id = svc.events().get(calendarId=gcal.CALENDARS[args.calendar], eventId=args.id).execute().get("recurringEventId", args.id)
+    svc.events().delete(calendarId=gcal.CALENDARS[args.calendar], eventId=event_id, sendUpdates=send_updates).execute()
+    return {"id": event_id}
+
+
+# ---------------------------------------------------------------- Exchange
+
+def ews(body: str, strict: bool = True) -> "ET.Element":
+    """Send one SOAP request. With strict, any response message that is not a
+    Success fails the whole command; GetUserAvailability passes strict=False
+    because it answers per address, and one colleague without free/busy data
+    must not hide the rest."""
+    import urllib.error, urllib.request, xml.etree.ElementTree as ET
+    exchange = load(EXCHANGE, "mailday_exchange")
+    envelope = f"""<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+  xmlns:t="{exchange.NS['t']}" xmlns:m="{exchange.NS['m']}">
+  <soap:Header>
+    <t:RequestServerVersion Version="Exchange2016"/>
+    <t:TimeZoneContext><t:TimeZoneDefinition Id="{ews_zone()[0]}"/></t:TimeZoneContext>
+  </soap:Header>
+  <soap:Body>{body}</soap:Body>
+</soap:Envelope>"""
+    request = urllib.request.Request(exchange.EWS, envelope.encode(), {
+        "Authorization": f"Bearer {exchange.access_token()}",
+        "Content-Type": "text/xml; charset=utf-8", "X-AnchorMailbox": exchange.LOGIN})
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            root = ET.fromstring(response.read())
+    except urllib.error.HTTPError as error:
+        # A SOAP fault arrives as HTTP 500 with the reason in the body.
+        detail = ""
+        try:
+            fault = ET.fromstring(error.read())
+            detail = next((el.text for el in fault.iter() if el.tag.endswith(("faultstring", "Message")) and el.text), "")
+        except Exception:
+            pass
+        fail(f"EWS: {detail or f'HTTP {error.code} {error.reason}'}")
+    for message in root.iter() if strict else ():
+        if message.tag.endswith("ResponseMessage") and message.get("ResponseClass") not in (None, "Success"):
+            text = message.findtext(f"{{{exchange.NS['m']}}}MessageText") or message.get("ResponseClass")
+            fail(f"EWS: {text}")
+    return root, exchange.NS
+
+
+def mailbox_zone_name() -> str:
+    """[exchange] mailbox_tz (env MAILDAY_EXCHANGE_MAILBOX_TZ wins), else
+    [calendar] home_zone, else UTC."""
+    return (os.environ.get("MAILDAY_EXCHANGE_MAILBOX_TZ") or setting("exchange", "mailbox_tz")
+            or setting("calendar", "home_zone") or "UTC")
+
+
+def mailbox_zone() -> ZoneInfo:
+    """The Exchange mailbox's own zone. Exchange keeps an all-day event as
+    midnight in this zone, and mailday-exchange reads it back in it, so an
+    all-day date must be written in it too, wherever the laptop is."""
+    return ZoneInfo(mailbox_zone_name())
+
+
+def mailbox_windows_zone() -> str:
+    return WINDOWS_ZONES.get(mailbox_zone_name(), "UTC")
+
+
+def ews_time(value: str, all_day: bool) -> str:
+    if all_day:
+        day = dt.date.fromisoformat(value[:10])
+        midnight = dt.datetime(day.year, day.month, day.day, tzinfo=mailbox_zone())
+        return midnight.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return parse_time(value, ews_zone()[1]).astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def exchange_create(args) -> dict:
+    fields = f"<t:Subject>{xml_escape(args.title)}</t:Subject>"
+    if args.notes:
+        fields += f'<t:Body BodyType="Text">{xml_escape(args.notes)}</t:Body>'
+    fields += f"<t:Start>{ews_time(args.start, args.all_day)}</t:Start><t:End>{ews_time(args.end, args.all_day)}</t:End>"
+    if args.all_day:
+        fields += "<t:IsAllDayEvent>true</t:IsAllDayEvent>"
+    if args.location:
+        fields += f"<t:Location>{xml_escape(args.location)}</t:Location>"
+    invitations = "SendToNone"
+    recurrence = ews_recurrence(args.rrule, args.start, args.all_day) if args.rrule else ""
+    if args.attendee:
+        fields += "<t:RequiredAttendees>" + "".join(
+            f"<t:Attendee><t:Mailbox><t:EmailAddress>{xml_escape(a)}</t:EmailAddress></t:Mailbox></t:Attendee>"
+            for a in args.attendee) + "</t:RequiredAttendees>"
+        invitations = "SendToAllAndSaveCopy"
+    fields += recurrence
+    if recurrence:
+        # A repeating all-day event belongs to the mailbox's day (see
+        # mailbox_zone); a timed one to the wall clock it was typed in.
+        windows = mailbox_windows_zone() if args.all_day else ews_zone()[0]
+        fields += f'<t:StartTimeZone Id="{windows}"/><t:EndTimeZone Id="{windows}"/>'
+    root, ns = ews(f"""<m:CreateItem SendMeetingInvitations="{invitations}">
+  <m:SavedItemFolderId><t:DistinguishedFolderId Id="calendar"/></m:SavedItemFolderId>
+  <m:Items><t:CalendarItem>{fields}</t:CalendarItem></m:Items>
+</m:CreateItem>""")
+    item = root.find(".//t:ItemId", ns)
+    return {"id": item.get("Id") if item is not None else ""}
+
+
+EWS_DAYS = {"MO": "Monday", "TU": "Tuesday", "WE": "Wednesday", "TH": "Thursday",
+            "FR": "Friday", "SA": "Saturday", "SU": "Sunday"}
+
+
+def ews_recurrence(rule: str, start: str, all_day: bool = False) -> str:
+    """An RRULE as EWS Recurrence XML: daily, weekly (on days) or monthly
+    (on the start's day of the month), ending on a date, after a count, or never.
+    The dates are in the zone EWS is told (the machine's, the user's intended
+    wall clock), so a start sent in another offset is converted first (an
+    all-day start is already a date)."""
+    zone = ews_zone()[1]
+    parts = dict(p.split("=", 1) for p in rule.split(";") if "=" in p)
+    interval = parts.get("INTERVAL", "1")
+    if all_day:
+        first = start[:10]
+    else:
+        first = parse_time(start, zone).astimezone(zone).date().isoformat()
+    freq = parts.get("FREQ")
+    if freq == "DAILY":
+        pattern = f"<t:DailyRecurrence><t:Interval>{interval}</t:Interval></t:DailyRecurrence>"
+    elif freq == "WEEKLY":
+        days = parts.get("BYDAY") or ["MO", "TU", "WE", "TH", "FR", "SA", "SU"][dt.date.fromisoformat(first).weekday()]
+        names = " ".join(EWS_DAYS[d] for d in days.split(","))
+        pattern = (f"<t:WeeklyRecurrence><t:Interval>{interval}</t:Interval>"
+                   f"<t:DaysOfWeek>{names}</t:DaysOfWeek></t:WeeklyRecurrence>")
+    elif freq == "MONTHLY":
+        pattern = (f"<t:AbsoluteMonthlyRecurrence><t:Interval>{interval}</t:Interval>"
+                   f"<t:DayOfMonth>{int(first[8:10])}</t:DayOfMonth></t:AbsoluteMonthlyRecurrence>")
+    else:
+        fail(f"cannot repeat {freq} on Exchange")
+    if "UNTIL" in parts:
+        end = (f"<t:EndDateRecurrence><t:StartDate>{first}</t:StartDate>"
+               f"<t:EndDate>{until_date(parts['UNTIL'], zone):%Y-%m-%d}</t:EndDate></t:EndDateRecurrence>")
+    elif "COUNT" in parts:
+        end = (f"<t:NumberedRecurrence><t:StartDate>{first}</t:StartDate>"
+               f"<t:NumberOfOccurrences>{parts['COUNT']}</t:NumberOfOccurrences></t:NumberedRecurrence>")
+    else:
+        end = f"<t:NoEndRecurrence><t:StartDate>{first}</t:StartDate></t:NoEndRecurrence>"
+    return f"<t:Recurrence>{pattern}{end}</t:Recurrence>"
+
+
+def exchange_update(args) -> dict:
+    def field(uri: str, element: str) -> str:
+        return f'<t:SetItemField><t:FieldURI FieldURI="{uri}"/><t:CalendarItem>{element}</t:CalendarItem></t:SetItemField>'
+    updates = ""
+    if args.title is not None:
+        updates += field("item:Subject", f"<t:Subject>{xml_escape(args.title)}</t:Subject>")
+    if args.notes is not None:
+        updates += field("item:Body", f'<t:Body BodyType="Text">{xml_escape(args.notes)}</t:Body>')
+    if args.start:
+        updates += field("calendar:Start", f"<t:Start>{ews_time(args.start, args.all_day)}</t:Start>")
+        updates += field("calendar:End", f"<t:End>{ews_time(args.end, args.all_day)}</t:End>")
+        updates += field("calendar:IsAllDayEvent", f"<t:IsAllDayEvent>{'true' if args.all_day else 'false'}</t:IsAllDayEvent>")
+    if args.location is not None:
+        updates += field("calendar:Location", f"<t:Location>{xml_escape(args.location)}</t:Location>")
+    for address in args.attendee:
+        updates += ('<t:AppendToItemField><t:FieldURI FieldURI="calendar:RequiredAttendees"/><t:CalendarItem>'
+                    f"<t:RequiredAttendees><t:Attendee><t:Mailbox><t:EmailAddress>{xml_escape(address)}</t:EmailAddress>"
+                    "</t:Mailbox></t:Attendee></t:RequiredAttendees></t:CalendarItem></t:AppendToItemField>")
+    if not updates:
+        fail("nothing to change")
+    ews(f"""<m:UpdateItem ConflictResolution="AlwaysOverwrite" SendMeetingInvitationsOrCancellations="SendToAllAndSaveCopy">
+  <m:ItemChanges><t:ItemChange><t:ItemId Id="{xml_escape(args.id)}"/><t:Updates>{updates}</t:Updates></t:ItemChange></m:ItemChanges>
+</m:UpdateItem>""")
+    return {"id": args.id}
+
+
+def exchange_delete(args, cancellations: str = "SendToAllAndSaveCopy") -> dict:
+    # The whole series is addressed through any one of its occurrences.
+    target = (f'<t:RecurringMasterItemId OccurrenceId="{xml_escape(args.id)}"/>' if args.series
+              else f'<t:ItemId Id="{xml_escape(args.id)}"/>')
+    ews(f"""<m:DeleteItem DeleteType="MoveToDeletedItems" SendMeetingCancellations="{cancellations}">
+  <m:ItemIds>{target}</m:ItemIds>
+</m:DeleteItem>""")
+    return {"id": args.id}
+
+
+def exchange_respond(args) -> dict:
+    element = {"accept": "AcceptItem", "tentative": "TentativelyAcceptItem", "decline": "DeclineItem"}[args.answer]
+    ews(f"""<m:CreateItem MessageDisposition="SendAndSaveCopy">
+  <m:Items><t:{element}><t:ReferenceItemId Id="{xml_escape(args.id)}"/></t:{element}></m:Items>
+</m:CreateItem>""")
+    return {"id": args.id, "answer": args.answer}
+
+
+def zone_changes(zone: ZoneInfo, year: int) -> list[tuple[int, dt.datetime, int]]:
+    """The UTC-offset changes of zone in year, found by walking the year hour
+    by hour: (minutes east of UTC before, wall time on the clock just before
+    the change, minutes east of UTC after)."""
+    minute = dt.timedelta(minutes=1)
+    moment = dt.datetime(year, 1, 1, tzinfo=dt.timezone.utc)
+    end = dt.datetime(year + 1, 1, 1, tzinfo=dt.timezone.utc)
+    before = moment.astimezone(zone).utcoffset()
+    changes = []
+    while moment < end:
+        moment += dt.timedelta(hours=1)
+        after = moment.astimezone(zone).utcoffset()
+        if after != before:
+            changes.append((before // minute, (moment + before).replace(tzinfo=None), after // minute))
+            before = after
+    return changes
+
+
+def ews_timezone_xml(zone: ZoneInfo, year: int) -> str:
+    """The t:TimeZone element (Bias, StandardTime, DaylightTime) for zone, as
+    its rules stand in year. Bias is minutes west of UTC; the two transition
+    rules are "DayOrder-th DayOfWeek of Month at Time" (5 is the last), read off
+    the zone's real changes, so EU, US and southern rules all come out right.
+    A zone without exactly one change each way gets identical Standard and
+    Daylight rules with a Bias of 0, which Exchange reads as no daylight time."""
+    def rule(bias: int, wall: dt.datetime) -> str:
+        last = wall.day + 7 > calendar.monthrange(wall.year, wall.month)[1]
+        order = 5 if last else (wall.day - 1) // 7 + 1
+        return (f"<t:Bias>{bias}</t:Bias><t:Time>{wall:%H:%M:%S}</t:Time><t:DayOrder>{order}</t:DayOrder>"
+                f"<t:Month>{wall.month}</t:Month><t:DayOfWeek>{wall:%A}</t:DayOfWeek>")
+    changes = zone_changes(zone, year)
+    if len(changes) != 2 or (changes[0][2] > changes[0][0]) == (changes[1][2] > changes[1][0]):
+        offset = dt.datetime(year, 1, 1, tzinfo=zone).utcoffset() // dt.timedelta(minutes=1)
+        flat = rule(0, dt.datetime(year, 1, 1))
+        return f"<t:Bias>{-offset}</t:Bias><t:StandardTime>{flat}</t:StandardTime><t:DaylightTime>{flat}</t:DaylightTime>"
+    to_daylight = next(c for c in changes if c[2] > c[0])
+    to_standard = next(c for c in changes if c[2] < c[0])
+    return (f"<t:Bias>{-to_standard[2]}</t:Bias>"
+            f"<t:StandardTime>{rule(0, to_standard[1])}</t:StandardTime>"
+            f"<t:DaylightTime>{rule(-(to_daylight[2] - to_daylight[0]), to_daylight[1])}</t:DaylightTime>")
+
+
+def exchange_freebusy(args) -> dict:
+    """Busy times of colleagues from Exchange, in UTC, per address. Exchange
+    reads and writes these times in the request's TimeZoneContext (the
+    machine's zone), whatever the TimeZone element says, so the window is asked
+    in that zone's wall clock and the answer read back in it. The TimeZone
+    element is still filled in properly from the same zone."""
+    windows, local = ews_zone()
+    start = parse_time(args.start, local).astimezone(local)
+    end = parse_time(args.end, local).astimezone(local)
+    zone = ews_timezone_xml(local, start.year)
+    mailboxes = "".join(f"<t:MailboxData><t:Email><t:Address>{xml_escape(a)}</t:Address></t:Email>"
+                        "<t:AttendeeType>Required</t:AttendeeType><t:ExcludeConflicts>false</t:ExcludeConflicts></t:MailboxData>"
+                        for a in args.attendee)
+    root, ns = ews(f"""<m:GetUserAvailabilityRequest>
+  <t:TimeZone>{zone}</t:TimeZone>
+  <m:MailboxDataArray>{mailboxes}</m:MailboxDataArray>
+  <t:FreeBusyViewOptions>
+    <t:TimeWindow><t:StartTime>{start:%Y-%m-%dT%H:%M:%S}</t:StartTime><t:EndTime>{end:%Y-%m-%dT%H:%M:%S}</t:EndTime></t:TimeWindow>
+    <t:MergedFreeBusyIntervalInMinutes>15</t:MergedFreeBusyIntervalInMinutes>
+    <t:RequestedView>FreeBusy</t:RequestedView>
+  </t:FreeBusyViewOptions>
+</m:GetUserAvailabilityRequest>""", strict=False)
+    def utc(text: str) -> str:
+        value = dt.datetime.fromisoformat(text)
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=local)
+        return value.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    busy, errors = {}, {}
+    responses = root.findall(f".//{{{ns['m']}}}FreeBusyResponse")
+    for address, response in zip(args.attendee, responses):
+        message = response.find(f"{{{ns['m']}}}ResponseMessage")
+        if message is not None and message.get("ResponseClass") != "Success":
+            errors[address] = message.findtext(f"{{{ns['m']}}}MessageText") or "no free/busy"
+            continue
+        spans = []
+        for event in response.iter(f"{{{ns['t']}}}CalendarEvent"):
+            if event.findtext(f"{{{ns['t']}}}BusyType") in ("Free", "WorkingElsewhere"):
+                continue
+            spans.append([utc(event.findtext(f"{{{ns['t']}}}StartTime")), utc(event.findtext(f"{{{ns['t']}}}EndTime"))])
+        busy[address] = spans
+    return {"busy": busy, "errors": errors}
+
+
+# ---------------------------------------------------------------- moving between calendars
+
+def quietly(action, *args) -> tuple[object, str]:
+    """Run a backend call whose fail() would print JSON and exit; return its
+    result and the error text instead (empty when it worked)."""
+    captured = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(captured):
+            return action(*args), ""
+    except SystemExit:
+        try:
+            return None, json.loads(captured.getvalue().strip().splitlines()[-1])["error"]
+        except (ValueError, IndexError, KeyError):
+            return None, "failed"
+    except Exception as error:
+        return None, f"{type(error).__name__}: {error}"
+
+
+def google_notes(args) -> str:
+    gcal, svc = google()
+    event = svc.events().get(calendarId=gcal.CALENDARS[args.calendar], eventId=args.id).execute()
+    return event.get("description", "")
+
+
+def exchange_body_text(root, ns) -> str:
+    body = root.find(".//t:CalendarItem/t:Body", ns)
+    return (body.text or "").strip() if body is not None else ""
+
+
+def exchange_notes(args) -> str:
+    root, ns = ews(f"""<m:GetItem>
+  <m:ItemShape><t:BaseShape>IdOnly</t:BaseShape><t:BodyType>Text</t:BodyType>
+    <t:AdditionalProperties><t:FieldURI FieldURI="item:Body"/></t:AdditionalProperties>
+  </m:ItemShape>
+  <m:ItemIds><t:ItemId Id="{xml_escape(args.id)}"/></m:ItemIds>
+</m:GetItem>""")
+    return exchange_body_text(root, ns)
+
+
+def transfer(args, backends: dict) -> dict:
+    source, target = backends[args.calendar], backends.get(args.to)
+    if target is None:
+        fail(f"{args.to} is not a calendar Mailday can write to")
+    if source == "google" and target == "google":
+        gcal, svc = google()
+        moved = svc.events().move(calendarId=gcal.CALENDARS[args.calendar], eventId=args.id,
+                                  destination=gcal.CALENDARS[args.to]).execute()
+        # Other changes made in the same edit go on after the move; the
+        # description only when --notes was given, so a move never rewrites it.
+        if args.title or args.start or args.location is not None or args.notes is not None:
+            args.calendar, args.id = args.to, moved["id"]
+            google_update(args)
+        return {"id": moved["id"]}
+    if not args.title or not args.start:
+        fail("moving between Google and Exchange needs --title, --start and --end")
+    old_calendar, old_id = args.calendar, args.id
+    warning = ""
+    if args.notes is None:
+        # The new event is built from the flags, so without --notes it would
+        # lose the original's description: copy it from the source.
+        notes, problem = quietly(google_notes if source == "google" else exchange_notes, args)
+        if problem:
+            # Deleting the original would lose its notes for good: stop here,
+            # before anything is created.
+            fail(f"not moved: the notes of the original in {old_calendar} could not be read ({problem})")
+        if notes:
+            args.notes = notes
+    args.calendar = args.to
+    created = (google_create if target == "google" else exchange_create)(args)
+    args.calendar, args.id = old_calendar, old_id
+    # The guests were not invited to the copy, so the old event goes without
+    # a cancellation to them.
+    _, problem = quietly(google_delete, args, "none") if source == "google" else quietly(exchange_delete, args, "SendToNone")
+    result = {"id": created["id"]}
+    if warning:
+        result["warning"] = warning
+    if problem:
+        print(json.dumps({"error": f"created in {args.to} (id {created['id']}) but could not delete the original from "
+                                   f"{old_calendar}: {problem}; the event now exists in both calendars",
+                          "partial": True, **result}))
+        sys.exit(1)
+    return result
+
+
+# ---------------------------------------------------------------- CLI
+
+def writable() -> list[dict]:
+    calendars = []
+    if GCAL is not None and GCAL.exists():
+        gcal = load(GCAL, "gcal")
+        calendars += [{"name": name, "backend": "google"} for name in gcal.CALENDARS]
+    if exchange_user() and EXCHANGE.exists():
+        calendars.append({"name": EXCHANGE_CALENDAR, "backend": "exchange"})
+    return calendars
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("calendars")
+    sub.add_parser("login")
+    psync = sub.add_parser("proposals-sync", help="accept proposals whose colour was changed outside Mailday")
+    psync.add_argument("--calendar", default="Personal")
+    freebusy = sub.add_parser("freebusy")
+    freebusy.add_argument("--attendee", action="append", required=True)
+    freebusy.add_argument("--start", required=True)
+    freebusy.add_argument("--end", required=True)
+    for name in ("create", "update", "delete", "transfer", "respond"):
+        command = sub.add_parser(name)
+        command.add_argument("--calendar", required=True)
+        if name != "create":
+            command.add_argument("--id", required=True)
+        if name in ("create", "update"):
+            command.add_argument("--attendee", action="append", default=[])
+        else:
+            command.set_defaults(attendee=[])
+        if name == "create":
+            command.add_argument("--rrule")
+            command.add_argument("--proposal", metavar="SOURCE",
+                                 help="tentative event the user accepts or declines in Mailday; SOURCE names where it came from")
+            command.add_argument("--proposal-group", metavar="KEY",
+                                 help="with --proposal: alternatives sharing KEY; accepting one deletes the rest")
+        else:
+            command.set_defaults(rrule=None)
+        if name == "delete":
+            command.add_argument("--series", action="store_true", help="the whole repeating series")
+        else:
+            command.set_defaults(series=False)
+        if name == "transfer":
+            command.add_argument("--to", required=True)
+        if name == "respond":
+            command.add_argument("--answer", required=True, choices=["accept", "tentative", "decline"])
+        if name not in ("delete", "respond"):
+            command.add_argument("--title", required=name == "create")
+            command.add_argument("--start")
+            command.add_argument("--end")
+            command.add_argument("--all-day", action="store_true")
+            command.add_argument("--timed", action="store_true")
+            command.add_argument("--location")
+            command.add_argument("--notes")
+    args = parser.parse_args()
+
+    if args.command == "calendars":
+        print(json.dumps({"calendars": writable()}))
+        return
+    if args.command == "freebusy":
+        if not exchange_user() or not EXCHANGE.exists():
+            fail("free/busy needs Exchange: set user under [exchange] in ~/.config/mailday/config.toml")
+        print(json.dumps({"ok": True, **exchange_freebusy(args)}))
+        return
+    if args.command == "proposals-sync":
+        print(json.dumps({"ok": True, **proposals_sync(args)}))
+        return
+    if args.command == "login":
+        require_google()
+        gcal = load(GCAL, "gcal")
+        gcal.service(interactive=True, user=True).calendarList().get(calendarId="primary").execute()
+        note_login("ok")
+        print(json.dumps({"ok": True, "login": "google"}))
+        return
+    if args.command not in ("delete", "respond") and bool(args.start) != bool(args.end):
+        fail("--start and --end go together")
+    if args.command == "create" and not args.start:
+        fail("a new event needs --start and --end")
+    backends = {c["name"]: c["backend"] for c in writable()}
+    backend = backends.get(args.calendar)
+    if backend is None:
+        fail(f"{args.calendar} is not a calendar Mailday can write to; known: {', '.join(backends)}")
+    action = {("google", "create"): google_create, ("google", "update"): google_update,
+              ("google", "delete"): google_delete, ("google", "respond"): google_respond,
+              ("exchange", "create"): exchange_create, ("exchange", "update"): exchange_update,
+              ("exchange", "delete"): exchange_delete, ("exchange", "respond"): exchange_respond,
+              }.get((backend, args.command), lambda a: transfer(a, backends))
+    try:
+        result = action(args)
+    except SystemExit:
+        raise
+    except Exception as error:  # googleapiclient.errors.HttpError and friends
+        fail(f"{type(error).__name__}: {error}")
+    print(json.dumps({"ok": True, **result}))
+
+
+if __name__ == "__main__":
+    main()

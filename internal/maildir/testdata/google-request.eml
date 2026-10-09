@@ -1,0 +1,77 @@
+From: Kim Organiser <kim@example.org>
+To: sam.devries@gmail.example
+Subject: Invitation: Reading group @ Weekly on Wednesday
+Date: Thu, 8 Oct 2026 11:15:00 +0000
+Message-ID: <google-request@example.org>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="mix"
+
+--mix
+Content-Type: multipart/alternative; boundary="alt"
+
+--alt
+Content-Type: text/plain; charset="UTF-8"
+
+You have been invited to Reading group.
+
+--alt
+Content-Type: text/calendar; charset="UTF-8"; method=REQUEST
+Content-Transfer-Encoding: quoted-printable
+
+BEGIN:VCALENDAR
+PRODID:-//Google Inc//Google Calendar 70.9054//EN
+VERSION:2.0
+CALSCALE:GREGORIAN
+METHOD:REQUEST
+BEGIN:VEVENT
+DTSTART:20261014T120000Z
+DTEND:20261014T130000Z
+RRULE:FREQ=3DWEEKLY;BYDAY=3DWE
+DTSTAMP:20261008T091500Z
+ORGANIZER;CN=3DKim Organiser:mailto:kim@example.org
+UID:abc123def@google.com
+ATTENDEE;CUTYPE=3DINDIVIDUAL;ROLE=3DREQ-PARTICIPANT;PARTSTAT=3DACCEPTED;CN=
+=3DKim Organiser;X-NUM-GUESTS=3D0:mailto:kim@example.org
+ATTENDEE;CUTYPE=3DINDIVIDUAL;ROLE=3DREQ-PARTICIPANT;PARTSTAT=3DTENTATIVE;RS=
+VP=3DTRUE;CN=3DSam;X-NUM-GUESTS=3D0:mailto:sam.devries@gmail.example
+SEQUENCE:1
+SUMMARY:Reading group
+LOCATION:https://meet.google.com/abc-defg-hij
+DESCRIPTION:Weekly reading group.\nJoin with Google Meet: https://meet.goog=
+le.com/abc-defg-hij
+STATUS:CONFIRMED
+TRANSP:OPAQUE
+END:VEVENT
+END:VCALENDAR
+
+--alt--
+
+--mix
+Content-Type: application/ics; name="invite.ics"
+Content-Disposition: attachment; filename="invite.ics"
+Content-Transfer-Encoding: base64
+
+QkVHSU46VkNBTEVOREFSDQpQUk9ESUQ6LS8vR29vZ2xlIEluYy8vR29vZ2xlIENhbGVuZGFyIDcw
+LjkwNTQvL0VODQpWRVJTSU9OOjIuMA0KQ0FMU0NBTEU6R1JFR09SSUFODQpNRVRIT0Q6UkVRVUVT
+VA0KQkVHSU46VkVWRU5UDQpEVFNUQVJUOjIwMjYxMDE0VDEyMDAwMFoNCkRURU5EOjIwMjYxMDE0
+VDEzMDAwMFoNClJSVUxFOkZSRVE9V0VFS0xZO0JZREFZPVdFDQpEVFNUQU1QOjIwMjYxMDA4VDA5
+MTUwMFoNCk9SR0FOSVpFUjtDTj1LaW0gT3JnYW5pc2VyOm1haWx0bzpraW1AZXhhbXBsZS5vcmcN
+ClVJRDphYmMxMjNkZWZAZ29vZ2xlLmNvbQ0KQVRURU5ERUU7Q1VUWVBFPUlORElWSURVQUw7Uk9M
+RT1SRVEtUEFSVElDSVBBTlQ7UEFSVFNUQVQ9QUNDRVBURUQ7Q049S2ltIE9yZ2FuaXNlcjtYLU5V
+TS1HVUVTVFM9MDptYWlsdG86a2ltQGV4YW1wbGUub3JnDQpBVFRFTkRFRTtDVVRZUEU9SU5ESVZJ
+RFVBTDtST0xFPVJFUS1QQVJUSUNJUEFOVDtQQVJUU1RBVD1URU5UQVRJVkU7UlNWUD1UUlVFO0NO
+PVNhbTtYLU5VTS1HVUVTVFM9MDptYWlsdG86c2FtLmRldnJpZXNAZ21haWwuZXhhbXBsZQ0KU0VR
+VUVOQ0U6MQ0KU1VNTUFSWTpSZWFkaW5nIGdyb3VwDQpMT0NBVElPTjpodHRwczovL21lZXQuZ29v
+Z2xlLmNvbS9hYmMtZGVmZy1oaWoNCkRFU0NSSVBUSU9OOldlZWtseSByZWFkaW5nIGdyb3VwLlxu
+Sm9pbiB3aXRoIEdvb2dsZSBNZWV0OiBodHRwczovL21lZXQuZ29vZ2xlLmNvbS9hYmMtZGVmZy1o
+aWoNClNUQVRVUzpDT05GSVJNRUQNClRSQU5TUDpPUEFRVUUNCkVORDpWRVZFTlQNCkVORDpWQ0FM
+RU5EQVINCg==
+
+--mix
+Content-Type: application/pdf; name="agenda.pdf"
+Content-Disposition: attachment; filename="agenda.pdf"
+Content-Transfer-Encoding: base64
+
+JVBERi0xLjQK
+
+--mix--
